@@ -52,7 +52,8 @@ bool GetScreenList(DesktopCapturer::SourceList* screens,
       continue;
     }
 
-    screens->push_back({device_index, std::string()});
+    // screens->push_back({device_index, std::string()});
+    screens->push_back({device_index, rtc::ToUtf8(device.DeviceName)});
     if (device_names) {
       device_names->push_back(rtc::ToUtf8(device.DeviceName));
     }

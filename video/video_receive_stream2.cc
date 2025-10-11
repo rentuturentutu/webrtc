@@ -1002,6 +1002,49 @@ bool VideoReceiveStream2::IsReceivingKeyFrame(Timestamp now) const {
   return receiving_keyframe;
 }
 
+// void VideoReceiveStream2::UpdatePlayoutDelays() const {
+//   RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
+//   const std::initializer_list<absl::optional<TimeDelta>> min_delays = {
+//       frame_minimum_playout_delay_, base_minimum_playout_delay_,
+//       syncable_minimum_playout_delay_};
+
+//   // Since nullopt < anything, this will return the largest of the minumum
+//   // delays, or nullopt if all are nullopt.
+//   absl::optional<TimeDelta> minimum_delay = std::max(min_delays);
+//   if (minimum_delay) {
+//     auto num_playout_delays_set =
+//         absl::c_count_if(min_delays, [](auto opt) { return opt.has_value(); });
+//     if (num_playout_delays_set > 1 &&
+//         timing_->min_playout_delay() != minimum_delay) {
+//       RTC_LOG(LS_WARNING)
+//           << "Multiple playout delays set. Actual delay value set to "
+//           << *minimum_delay << " frame min delay="
+//           << OptionalDelayToLogString(frame_minimum_playout_delay_)
+//           << " base min delay="
+//           << OptionalDelayToLogString(base_minimum_playout_delay_)
+//           << " sync min delay="
+//           << OptionalDelayToLogString(syncable_minimum_playout_delay_);
+//     }
+//     timing_->set_min_playout_delay(*minimum_delay);
+//     if (frame_minimum_playout_delay_ == TimeDelta::Zero() &&
+//         frame_maximum_playout_delay_ > TimeDelta::Zero()) {
+//       // TODO(kron): Estimate frame rate from video stream.
+//       constexpr Frequency kFrameRate = Frequency::Hertz(60);
+//       // Convert playout delay in ms to number of frames.
+//       int max_composition_delay_in_frames =
+//           std::lrint(*frame_maximum_playout_delay_ * kFrameRate);
+//       // Subtract frames in buffer.
+//       max_composition_delay_in_frames =
+//           std::max(max_composition_delay_in_frames - buffer_->Size(), 0);
+//       timing_->SetMaxCompositionDelayInFrames(max_composition_delay_in_frames);
+//     }
+//   }
+
+//   if (frame_maximum_playout_delay_) {
+//     timing_->set_max_playout_delay(*frame_maximum_playout_delay_);
+//   }
+// }
+
 void VideoReceiveStream2::UpdatePlayoutDelays() const {
   RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
   const std::initializer_list<absl::optional<TimeDelta>> min_delays = {
@@ -1019,13 +1062,14 @@ void VideoReceiveStream2::UpdatePlayoutDelays() const {
       RTC_LOG(LS_WARNING)
           << "Multiple playout delays set. Actual delay value set to "
           << *minimum_delay << " frame min delay="
-          << OptionalDelayToLogString(frame_minimum_playout_delay_)
+          << OptionalDelayToLogString(frame_maximum_playout_delay_)
           << " base min delay="
           << OptionalDelayToLogString(base_minimum_playout_delay_)
           << " sync min delay="
           << OptionalDelayToLogString(syncable_minimum_playout_delay_);
     }
-    timing_->set_min_playout_delay(*minimum_delay);
+    // timing_->set_min_playout_delay(*minimum_delay);
+    timing_->set_min_playout_delay(TimeDelta::Zero());
     if (frame_minimum_playout_delay_ == TimeDelta::Zero() &&
         frame_maximum_playout_delay_ > TimeDelta::Zero()) {
       // TODO(kron): Estimate frame rate from video stream.
@@ -1041,8 +1085,14 @@ void VideoReceiveStream2::UpdatePlayoutDelays() const {
   }
 
   if (frame_maximum_playout_delay_) {
-    timing_->set_max_playout_delay(*frame_maximum_playout_delay_);
+    // timing_->set_max_playout_delay(*frame_maximum_playout_delay_);
+    timing_->set_max_playout_delay(TimeDelta::Zero());
   }
+
+
+
+  timing_->set_max_playout_delay(TimeDelta::Zero());
+  timing_->set_min_playout_delay(TimeDelta::Zero());
 }
 
 std::vector<webrtc::RtpSource> VideoReceiveStream2::GetSources() const {
