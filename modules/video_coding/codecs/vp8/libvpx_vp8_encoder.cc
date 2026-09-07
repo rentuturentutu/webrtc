@@ -587,6 +587,14 @@ int LibvpxVp8Encoder::InitEncode(const VideoCodec* inst,
           ? VPX_ERROR_RESILIENT_DEFAULT
           : 0;
 
+  // For screen sharing / remote desktop, lossy TURN-relay paths cause visible
+  // freezes when a single packet is lost. Always enable error resilience for
+  // screen-share streams (independent of temporal-layer count).
+  if (inst->mode == VideoCodecMode::kScreensharing &&
+      vpx_configs_[0].g_error_resilient == 0) {
+    vpx_configs_[0].g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+  }
+
   // Override the error resilience mode if this is not simulcast, but we are
   // using temporal layers.
   if (env_.field_trials().IsEnabled(kVp8ForcePartitionResilience) &&

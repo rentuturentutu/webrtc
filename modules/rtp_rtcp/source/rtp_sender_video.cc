@@ -670,6 +670,9 @@ bool RTPSenderVideo::SendVideo(int payload_type,
     }
 
     packet->set_first_packet_of_frame(i == 0);
+    if (video_header.encode_finish_time) {
+      packet->set_frame_encode_finish_time(*video_header.encode_finish_time);
+    }
 
     if (!packetizer->NextPacket(packet.get()))
       return false;

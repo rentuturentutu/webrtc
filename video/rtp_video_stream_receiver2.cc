@@ -1176,10 +1176,20 @@ bool RtpVideoStreamReceiver2::DeliverRtcp(const uint8_t* rtcp_packet,
       rtc::MakeArrayView(rtcp_packet, rtcp_packet_length));
 
   absl::optional<TimeDelta> rtt = rtp_rtcp_->LastRtt();
+#if defined(WEBRTC_WIN)
+  // A receive-dominant video stream may never produce an RTCP RTT sample even
+  // though sender reports are arriving normally. Do not block capture-clock
+  // mapping forever in that case. Zero RTT establishes the mapping with at
+  // most one-way-network-delay bias; a later real RTT sample automatically
+  // refines the estimator.
+  const TimeDelta clock_mapping_rtt = rtt.value_or(TimeDelta::Zero());
+#else
   if (!rtt.has_value()) {
-    // Waiting for valid rtt.
+    // Preserve the upstream behavior outside Windows.
     return true;
   }
+  const TimeDelta clock_mapping_rtt = *rtt;
+#endif
 
   absl::optional<RtpRtcpInterface::SenderReportStats> last_sr =
       rtp_rtcp_->GetSenderReportStats();
@@ -1189,9 +1199,22 @@ bool RtpVideoStreamReceiver2::DeliverRtcp(const uint8_t* rtcp_packet,
   }
   int64_t time_since_received = clock_->CurrentNtpInMilliseconds() -
                                 last_sr->last_arrival_timestamp.ToMs();
-  // Don't use old SRs to estimate time.
-  if (time_since_received <= 1) {
-    ntp_estimator_.UpdateRtcpTimestamp(*rtt, last_sr->last_remote_timestamp,
+  // Do not require the SR to be consumed in the same 1ms scheduler slice.
+  // The Windows remote-desktop pipeline can deliver RTCP to this sequence a
+  // few milliseconds after IncomingRtcpPacket updated the report stats; the
+  // old threshold rejected every sample, leaving ntp_time_ms at -1 for the
+  // whole session. One report interval is still a strict freshness bound, and
+  // UpdateMeasurements de-duplicates repeated reads of the same SR.
+  constexpr int64_t kFreshSenderReportMs =
+#if defined(WEBRTC_WIN)
+      1000;
+#else
+      1;
+#endif
+  if (time_since_received >= 0 &&
+      time_since_received <= kFreshSenderReportMs) {
+    ntp_estimator_.UpdateRtcpTimestamp(clock_mapping_rtt,
+                                       last_sr->last_remote_timestamp,
                                        last_sr->last_remote_rtp_timestamp);
     absl::optional<int64_t> remote_to_local_clock_offset =
         ntp_estimator_.EstimateRemoteToLocalClockOffset();

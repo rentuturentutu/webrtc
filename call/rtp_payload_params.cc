@@ -222,6 +222,11 @@ RTPVideoHeader RtpPayloadParams::GetRtpVideoHeader(
                                      ? absl::make_optional(*image.ColorSpace())
                                      : absl::nullopt;
   rtp_video_header.video_frame_tracking_id = image.VideoFrameTrackingId();
+  if (image.timing_.flags != VideoSendTiming::kInvalid &&
+      image.timing_.encode_finish_ms >= 0) {
+    rtp_video_header.encode_finish_time =
+        Timestamp::Millis(image.timing_.encode_finish_ms);
+  }
   SetVideoTiming(image, &rtp_video_header.video_timing);
 
   const bool is_keyframe = image._frameType == VideoFrameType::kVideoFrameKey;

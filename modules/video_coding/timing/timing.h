@@ -168,6 +168,14 @@ class VCMTiming {
   // Used only when the RTP header extension playout delay is set to min=0 ms
   // which is indicated by a render time set to 0.
   Timestamp last_decode_scheduled_ RTC_GUARDED_BY(mutex_);
+  // Set by the field trial WebRTC-DgjForceLowLatency. Pins the playout delay
+  // range to [0, 0] and makes set_min/max_playout_delay() no-ops, so
+  // UseLowLatencyRendering() is always true and frames are handed to the
+  // decoder as soon as they are complete. Remote desktop wants the freshest
+  // frame; the default range is [0, 10s], which keeps the low-latency path off
+  // and lets the jitter estimate turn into ~100ms of playout delay even on a
+  // 5ms LAN. Smoothing belongs on the capture side, not here.
+  const bool force_low_latency_;
 };
 }  // namespace webrtc
 

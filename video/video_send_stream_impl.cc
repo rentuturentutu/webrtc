@@ -216,6 +216,30 @@ absl::optional<float> GetConfiguredPacingFactor(
   if (!TransportSeqNumExtensionConfigured(config))
     return absl::nullopt;
 
+  // Local change: an explicitly configured WebRTC-Video-Pacing/factor wins over
+  // the ALR experiment default.
+  //
+  // Upstream order is ALR first, and GetAlrSettings() below always returns a
+  // value for screen content (it reads kScreenshareProbingBweExperimentName and
+  // that experiment has a default group), so the WebRTC-Video-Pacing lookup at
+  // the bottom of this function was dead code for us. Two rounds of setting
+  // factor to 3.0 and then 10.0 changed nothing; the [dgj] log below printed
+  // "configured = 1" both times.
+  //
+  // Why it matters: with factor 1 the pacer emits at exactly the target bitrate
+  // and has zero burst headroom, so packets sit in the queue waiting for budget.
+  // Measured totalPacketSendDelay/packetsSent on the sending side was 37.8ms
+  // average, 70.0ms peak -- the single largest term in the ~99ms end-to-end
+  // budget, and larger than everything we had been optimizing before it.
+  //
+  // Using a sentinel default rather than FieldTrialOptional keeps this to the
+  // one parser type already used by PacingConfig in this file.
+  FieldTrialParameter<double> explicit_pacing_factor("factor", -1.0);
+  ParseFieldTrial({&explicit_pacing_factor},
+                  field_trials.Lookup("WebRTC-Video-Pacing"));
+  if (explicit_pacing_factor.Get() > 0.0)
+    return static_cast<float>(explicit_pacing_factor.Get());
+
   absl::optional<AlrExperimentSettings> alr_settings =
       GetAlrSettings(field_trials, content_type);
   if (alr_settings)
@@ -491,6 +515,25 @@ VideoSendStreamImpl::VideoSendStreamImpl(
       queue_time_limit_ms = pacing_config_.max_pacing_delay.Get().ms();
     }
 
+    // Remote desktop is latency-first: bound the pacer queue for screen
+    // content so congestion drops frames early instead of accumulating a
+    // stale multi-hundred-millisecond backlog. Camera streams keep the
+    // default limit.
+    //
+    // 250 -> 30. The 250ms clamp was the right idea but never fired: see
+    // PacingController::SetPacingRates (:687-703), which only raises
+    // adjusted_media_rate_ once AverageQueueTime() approaches
+    // queue_time_limit_. Measured standing queue was 37.8ms average with a
+    // 70.0ms peak, nowhere near 250, so the pacer never sped up and the
+    // protection was inert. 30ms puts the closed loop on the quantity we
+    // actually care about (totalPacketSendDelay) instead of leaving it to the
+    // blanket pacing_factor multiplier.
+    if (content_type_ == VideoEncoderConfig::ContentType::kScreen) {
+      constexpr int kScreenshareMaxPacingDelayMs = 30;
+      queue_time_limit_ms =
+          std::min(queue_time_limit_ms, kScreenshareMaxPacingDelayMs);
+    }
+
     transport_->SetQueueTimeLimit(queue_time_limit_ms);
   }
 
@@ -500,6 +543,20 @@ VideoSendStreamImpl::VideoSendStreamImpl(
 
   if (enable_alr_bw_probing) {
     transport->EnablePeriodicAlrProbing(*enable_alr_bw_probing);
+  }
+
+  // Local addition: make it observable whether WebRTC-Video-Pacing actually
+  // took effect. GetConfiguredPacingFactor() returns nullopt unless
+  // transport-cc is negotiated (see :216), in which case the field trial is
+  // silently ignored and the transport keeps its own default. Without this line
+  // there is no way to tell the two cases apart from a log.
+  if (configured_pacing_factor_) {
+    RTC_LOG(LS_INFO) << "[dgj] pacing factor configured = "
+                     << *configured_pacing_factor_;
+  } else {
+    RTC_LOG(LS_WARNING) << "[dgj] pacing factor NOT configured "
+                           "(transport-cc not negotiated); "
+                           "WebRTC-Video-Pacing has no effect";
   }
 
   if (configured_pacing_factor_)

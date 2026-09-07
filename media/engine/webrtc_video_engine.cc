@@ -827,7 +827,18 @@ WebRtcVideoEngine::GetRtpHeaderExtensions() const {
     result.emplace_back(uri, id++, webrtc::RtpTransceiverDirection::kSendRecv);
   }
   for (const auto& uri : {webrtc::RtpExtension::kAbsoluteCaptureTimeUri}) {
-    result.emplace_back(uri, id, webrtc::RtpTransceiverDirection::kStopped);
+    // Remote desktop latency diagnostics need a capture timestamp that does
+    // not depend on RTCP SR convergence. WebRTC already generates and
+    // interpolates this standard extension, including remote-to-local clock
+    // offset estimation, so advertise it on both directions.
+    result.emplace_back(
+        uri, id,
+#if defined(WEBRTC_WIN)
+        webrtc::RtpTransceiverDirection::kSendRecv
+#else
+        webrtc::RtpTransceiverDirection::kStopped
+#endif
+    );
   }
   result.emplace_back(webrtc::RtpExtension::kGenericFrameDescriptorUri00, id,
                       IsEnabled(trials_, "WebRTC-GenericDescriptorAdvertised")

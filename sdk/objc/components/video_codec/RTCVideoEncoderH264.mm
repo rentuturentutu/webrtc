@@ -51,10 +51,11 @@
 
 namespace {  // anonymous namespace
 
-// The ratio between kVTCompressionPropertyKey_DataRateLimits and
-// kVTCompressionPropertyKey_AverageBitRate. The data rate limit is set higher
-// than the average bit rate to avoid undershooting the target.
-const float kLimitToAverageBitRateFactor = 10.0f;
+// Bound short desktop-motion bursts without forcing constant bitrate padding.
+// Two 30 FPS frames can overlap a 50 ms window, so retain 75% headroom while
+// preventing a single complex desktop frame from filling the socket queue.
+const float kRealtimePeakBitRateFactor = 1.75f;
+const float kRealtimePeakIntervalSeconds = 0.05f;
 // These thresholds deviate from the default h264 QP thresholds, as they
 // have been found to work better on devices that support VideoToolbox
 const int kLowH264QpThreshold = 28;
@@ -62,6 +63,35 @@ const int kHighH264QpThreshold = 39;
 const int kBitsPerByte = 8;
 
 const OSType kNV12PixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+
+void SetDuDeskVTBooleanProperty(VTSessionRef session,
+                                CFStringRef key,
+                                bool value,
+                                const char *name) {
+  OSStatus status = VTSessionSetProperty(session, key, value ? kCFBooleanTrue : kCFBooleanFalse);
+  if (status == noErr) {
+    RTC_LOG(LS_INFO) << "DUDESK_VIDEOTOOLBOX_LOW_LATENCY property=" << name << " accepted=1";
+  } else {
+    RTC_LOG(LS_WARNING) << "DUDESK_VIDEOTOOLBOX_LOW_LATENCY property=" << name
+                        << " accepted=0 status=" << status;
+  }
+}
+
+void SetDuDeskVTIntProperty(VTSessionRef session,
+                            CFStringRef key,
+                            int32_t value,
+                            const char *name) {
+  CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
+  OSStatus status = VTSessionSetProperty(session, key, number);
+  CFRelease(number);
+  if (status == noErr) {
+    RTC_LOG(LS_INFO) << "DUDESK_VIDEOTOOLBOX_LOW_LATENCY property=" << name
+                     << " accepted=1 value=" << value;
+  } else {
+    RTC_LOG(LS_WARNING) << "DUDESK_VIDEOTOOLBOX_LOW_LATENCY property=" << name
+                        << " accepted=0 value=" << value << " status=" << status;
+  }
+}
 
 typedef NS_ENUM(NSInteger, RTC_OBJC_TYPE(RTCVideoEncodeMode)) {
   RTC_OBJC_TYPE(RTCVideoEncodeModeVariable) = 0,
@@ -71,15 +101,20 @@ typedef NS_ENUM(NSInteger, RTC_OBJC_TYPE(RTCVideoEncodeMode)) {
 NSArray *CreateRateLimitArray(uint32_t computedBitrateBps, RTC_OBJC_TYPE(RTCVideoEncodeMode) mode) {
   switch (mode) {
     case RTC_OBJC_TYPE(RTCVideoEncodeModeVariable): {
+      uint32_t peakBytes =
+          static_cast<uint32_t>(computedBitrateBps / static_cast<float>(kBitsPerByte) *
+                                kRealtimePeakIntervalSeconds * kRealtimePeakBitRateFactor);
       // 5 seconds should be an okay interval for VBR to enforce the long-term
       // limit.
       float avgInterval = 5.0;
-      uint32_t avgBytesPerSecond = computedBitrateBps / kBitsPerByte * avgInterval;
-      // And the peak bitrate is measured per-second in a way similar to CBR.
-      float peakInterval = 1.0;
-      uint32_t peakBytesPerSecond =
-          computedBitrateBps * kLimitToAverageBitRateFactor / kBitsPerByte;
-      return @[ @(peakBytesPerSecond), @(peakInterval), @(avgBytesPerSecond), @(avgInterval) ];
+      uint32_t averageBytes = computedBitrateBps / kBitsPerByte * avgInterval;
+      RTC_LOG(LS_INFO) << "DUDESK_VIDEOTOOLBOX_RATE_LIMIT target_bps=" << computedBitrateBps
+                       << " peak_bytes=" << peakBytes << " peak_interval_ms="
+                       << static_cast<int>(kRealtimePeakIntervalSeconds * 1000)
+                       << " peak_factor=" << kRealtimePeakBitRateFactor
+                       << " average_bytes=" << averageBytes
+                       << " average_interval_ms=" << static_cast<int>(avgInterval * 1000);
+      return @[ @(peakBytes), @(kRealtimePeakIntervalSeconds), @(averageBytes), @(avgInterval) ];
     }
     case RTC_OBJC_TYPE(RTCVideoEncodeModeConstant): {
       // CBR should be enforces with granularity of a second.
@@ -391,7 +426,8 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
     RTC_DCHECK(_profile_level_id);
     RTC_LOG(LS_INFO) << "Using profile "
                      << CFStringToString(ExtractProfile(
-                            *_profile_level_id, _codecMode == RTC_OBJC_TYPE(RTCVideoCodecModeScreensharing)));
+                            *_profile_level_id,
+                            _codecMode == RTC_OBJC_TYPE(RTCVideoCodecModeScreensharing)));
     RTC_CHECK([codecInfo.name isEqualToString:RTC_CONSTANT_TYPE(RTCVideoCodecH264Name)]);
   }
   return self;
@@ -411,9 +447,9 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
   _codecMode = settings.mode;
   _maxQP = settings.qpMax;
 
-  _encodeMode = RTC_OBJC_TYPE(RTCVideoEncodeModeVariable);                    // Always variable mode for now
-  _minBitrate = settings.minBitrate * 1000;  // minBitrate is in kbps.
-  _maxBitrate = settings.maxBitrate * 1000;  // maxBitrate is in kbps.
+  _encodeMode = RTC_OBJC_TYPE(RTCVideoEncodeModeVariable);  // Always variable mode for now
+  _minBitrate = settings.minBitrate * 1000;                 // minBitrate is in kbps.
+  _maxBitrate = settings.maxBitrate * 1000;                 // maxBitrate is in kbps.
 
   uint32_t aligned_width = (((_width + 15) >> 4) << 4);
   uint32_t aligned_height = (((_height + 15) >> 4) << 4);
@@ -432,8 +468,8 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
   _encoderFrameRate = 0;
   if (settings.maxFramerate > _maxAllowedFrameRate && _maxAllowedFrameRate > 0) {
     RTC_LOG(LS_WARNING) << "Initial encoder frame rate setting " << settings.maxFramerate
-                        << " is larger than the "
-                        << "maximal allowed frame rate " << _maxAllowedFrameRate << ".";
+                        << " is larger than the " << "maximal allowed frame rate "
+                        << _maxAllowedFrameRate << ".";
   }
 
   // TODO(tkchin): Try setting payload size via
@@ -517,7 +553,8 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
   // Check if we need a keyframe.
   if (!isKeyframeRequired && frameTypes) {
     for (NSNumber *frameType in frameTypes) {
-      if ((RTC_OBJC_TYPE(RTCFrameType))frameType.intValue == RTC_OBJC_TYPE(RTCFrameTypeVideoFrameKey)) {
+      if ((RTC_OBJC_TYPE(RTCFrameType))frameType.intValue ==
+          RTC_OBJC_TYPE(RTCFrameTypeVideoFrameKey)) {
         isKeyframeRequired = YES;
         break;
       }
@@ -759,11 +796,21 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
           _compressionSession, kVTCompressionPropertyKey_MaxAllowedFrameQP, kHighH264QpThreshold);
     }
   }
-  SetVTSessionProperty(
-      _compressionSession,
-      kVTCompressionPropertyKey_ProfileLevel,
-      ExtractProfile(*_profile_level_id, _codecMode == RTC_OBJC_TYPE(RTCVideoCodecModeScreensharing)));
+  SetVTSessionProperty(_compressionSession,
+                       kVTCompressionPropertyKey_ProfileLevel,
+                       ExtractProfile(*_profile_level_id,
+                                      _codecMode == RTC_OBJC_TYPE(RTCVideoCodecModeScreensharing)));
   SetVTSessionProperty(_compressionSession, kVTCompressionPropertyKey_AllowFrameReordering, false);
+  SetDuDeskVTIntProperty(
+      _compressionSession, kVTCompressionPropertyKey_MaxFrameDelayCount, 0, "MaxFrameDelayCount");
+#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
+  SetDuDeskVTBooleanProperty(_compressionSession,
+                             CFSTR("PrioritizeEncodingSpeedOverQuality"),
+                             true,
+                             "PrioritizeEncodingSpeedOverQuality");
+  SetDuDeskVTBooleanProperty(
+      _compressionSession, CFSTR("LowLatencyRateControl"), true, "LowLatencyRateControl");
+#endif
 
   // [self updateEncoderBitrateAndFrameRate];
 
@@ -834,17 +881,19 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
     } else {
       RTC_LOG(LS_INFO) << "Did update encoder bitrate: " << computedBitrateBps;
     }
-
-    status = VTSessionSetProperty(
-        _compressionSession,
-        kVTCompressionPropertyKey_DataRateLimits,
-        (__bridge CFArrayRef)CreateRateLimitArray(computedBitrateBps, _encodeMode));
+    NSArray *rateLimits = CreateRateLimitArray(computedBitrateBps, _encodeMode);
+    status = VTSessionSetProperty(_compressionSession,
+                                  kVTCompressionPropertyKey_DataRateLimits,
+                                  (__bridge CFArrayRef)rateLimits);
     if (status != noErr) {
-      RTC_LOG(LS_ERROR) << "Failed to update encoder data rate limits";
+      RTC_LOG(LS_ERROR) << "DUDESK_VIDEOTOOLBOX_RATE_LIMIT_APPLY accepted=0 status=" << status
+                        << " target_bps=" << computedBitrateBps;
     } else {
-      RTC_LOG(LS_INFO) << "Did update encoder data rate limits";
+      RTC_LOG(LS_INFO) << "DUDESK_VIDEOTOOLBOX_RATE_LIMIT_APPLY accepted=1 target_bps="
+                       << computedBitrateBps << " peak_interval_ms="
+                       << static_cast<int>(kRealtimePeakIntervalSeconds * 1000)
+                       << " peak_factor=" << kRealtimePeakBitRateFactor;
     }
-
     _encoderBitrateBps = computedBitrateBps;
   }
 }
@@ -897,7 +946,8 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
                                          }];
   frame.encodedWidth = width;
   frame.encodedHeight = height;
-  frame.frameType = isKeyframe ? RTC_OBJC_TYPE(RTCFrameTypeVideoFrameKey) : RTC_OBJC_TYPE(RTCFrameTypeVideoFrameDelta);
+  frame.frameType = isKeyframe ? RTC_OBJC_TYPE(RTCFrameTypeVideoFrameKey) :
+                                 RTC_OBJC_TYPE(RTCFrameTypeVideoFrameDelta);
   frame.captureTimeMs = renderTimeMs;
   frame.timeStamp = timestamp;
   frame.rotation = rotation;
@@ -923,4 +973,3 @@ NSUInteger GetMaxSampleRate(const webrtc::H264ProfileLevelId &profile_level_id) 
 }
 
 @end
-

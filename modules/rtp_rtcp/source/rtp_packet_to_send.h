@@ -49,6 +49,15 @@ class RtpPacketToSend : public RtpPacket {
   webrtc::Timestamp capture_time() const { return capture_time_; }
   void set_capture_time(webrtc::Timestamp time) { capture_time_ = time; }
 
+  // Local-only frame timestamp used to measure encode completion to the
+  // transport handoff of the marker packet. It is never put on the wire.
+  absl::optional<webrtc::Timestamp> frame_encode_finish_time() const {
+    return frame_encode_finish_time_;
+  }
+  void set_frame_encode_finish_time(webrtc::Timestamp time) {
+    frame_encode_finish_time_ = time;
+  }
+
   void set_packet_type(RtpPacketMediaType type);
 
   absl::optional<RtpPacketMediaType> packet_type() const {
@@ -152,6 +161,7 @@ class RtpPacketToSend : public RtpPacket {
 
  private:
   webrtc::Timestamp capture_time_ = webrtc::Timestamp::Zero();
+  absl::optional<webrtc::Timestamp> frame_encode_finish_time_;
   absl::optional<RtpPacketMediaType> packet_type_;
   absl::optional<OriginalType> original_packet_type_;
   absl::optional<uint32_t> original_ssrc_;

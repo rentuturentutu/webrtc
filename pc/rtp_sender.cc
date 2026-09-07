@@ -857,8 +857,7 @@ void VideoRtpSender::SetSend() {
   cricket::VideoOptions options;
   VideoTrackSourceInterface* source = video_track()->GetSource();
   if (source) {
-    // options.is_screencast = source->is_screencast();
-    options.is_screencast = true;
+    options.is_screencast = source->is_screencast();
     options.video_noise_reduction = source->needs_denoising();
   }
   options.content_hint = cached_track_content_hint_;

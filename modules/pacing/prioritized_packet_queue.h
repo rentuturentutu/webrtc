@@ -54,6 +54,9 @@ class PrioritizedPacketQueue {
   // those queues in a round-robin fashion.
   std::unique_ptr<RtpPacketToSend> Pop();
 
+  // Returns the next packet without removing it, or nullptr when empty.
+  const RtpPacketToSend* Peek() const;
+
   // Number of packets in the queue.
   int SizeInPackets() const;
 
@@ -128,6 +131,8 @@ class PrioritizedPacketQueue {
     bool EnqueuePacket(QueuedPacket packet, int priority_level);
 
     QueuedPacket DequeuePacket(int priority_level);
+
+    const RtpPacketToSend* PeekPacket(int priority_level) const;
 
     bool HasPacketsAtPrio(int priority_level) const;
     bool IsEmpty() const;

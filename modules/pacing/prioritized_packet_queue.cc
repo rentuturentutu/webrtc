@@ -103,6 +103,12 @@ PrioritizedPacketQueue::StreamQueue::DequeuePacket(int priority_level) {
   return packet;
 }
 
+const RtpPacketToSend* PrioritizedPacketQueue::StreamQueue::PeekPacket(
+    int priority_level) const {
+  RTC_DCHECK(!packets_[priority_level].empty());
+  return packets_[priority_level].front().packet.get();
+}
+
 bool PrioritizedPacketQueue::StreamQueue::HasPacketsAtPrio(
     int priority_level) const {
   return !packets_[priority_level].empty();
@@ -231,6 +237,16 @@ std::unique_ptr<RtpPacketToSend> PrioritizedPacketQueue::Pop() {
   }
 
   return std::move(packet.packet);
+}
+
+const RtpPacketToSend* PrioritizedPacketQueue::Peek() const {
+  if (size_packets_ == 0) {
+    return nullptr;
+  }
+
+  RTC_DCHECK_GE(top_active_prio_level_, 0);
+  return streams_by_prio_[top_active_prio_level_].front()->PeekPacket(
+      top_active_prio_level_);
 }
 
 int PrioritizedPacketQueue::SizeInPackets() const {

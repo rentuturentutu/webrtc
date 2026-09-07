@@ -16,6 +16,7 @@
 #include <cmath>
 #include <iterator>
 #include <utility>
+#include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/types/optional.h"
@@ -35,6 +36,16 @@ namespace webrtc {
 namespace {
 
 constexpr size_t kDecoderFrameMemoryLength = 10;
+
+int64_t PercentileMs(std::vector<int64_t> samples, int percentile) {
+  if (samples.empty()) {
+    return -1;
+  }
+  std::sort(samples.begin(), samples.end());
+  const size_t index =
+      (samples.size() - 1) * static_cast<size_t>(percentile) / 100;
+  return samples[index];
+}
 
 }
 
@@ -215,6 +226,11 @@ void VCMDecodedFrameCallback::Decoded(VideoFrame& decodedImage,
   RTC_HISTOGRAM_COUNTS_1000(
       "WebRTC.Video.GenericDecoder.DecodeDelay",
       timing_frame_info.decode_finish_ms - timing_frame_info.decode_start_ms);
+  MaybeLogDuDeskReceiveLatency(
+      timing_frame_info.decode_finish_ms,
+      timing_frame_info.receive_finish_ms - timing_frame_info.receive_start_ms,
+      timing_frame_info.decode_start_ms - timing_frame_info.receive_finish_ms,
+      timing_frame_info.decode_finish_ms - timing_frame_info.decode_start_ms);
   _timing->SetTimingFrameInfo(timing_frame_info);
 
   decodedImage.set_timestamp_us(
@@ -222,6 +238,58 @@ void VCMDecodedFrameCallback::Decoded(VideoFrame& decodedImage,
   _receiveCallback->FrameToRender(decodedImage, qp, decode_time,
                                   frame_info->content_type,
                                   frame_info->frame_type);
+}
+
+void VCMDecodedFrameCallback::MaybeLogDuDeskReceiveLatency(
+    int64_t now_ms,
+    int64_t assembly_ms,
+    int64_t jitter_ms,
+    int64_t decode_ms) {
+  if (assembly_ms < 0 || jitter_ms < 0 || decode_ms < 0) {
+    return;
+  }
+
+  MutexLock lock(&lock_);
+  if (dgj_receive_last_log_ms_ == 0) {
+    dgj_receive_last_log_ms_ = now_ms;
+  }
+  dgj_assembly_samples_ms_.push_back(assembly_ms);
+  dgj_jitter_samples_ms_.push_back(jitter_ms);
+  dgj_decode_samples_ms_.push_back(decode_ms);
+  dgj_receive_to_decode_samples_ms_.push_back(assembly_ms + jitter_ms +
+                                               decode_ms);
+  if (now_ms - dgj_receive_last_log_ms_ < 1000) {
+    return;
+  }
+
+  RTC_LOG(LS_INFO)
+      << "DUDESK_RECEIVE_FRAME_LATENCY samples="
+      << dgj_assembly_samples_ms_.size()
+      << " assembly_p50_ms=" << PercentileMs(dgj_assembly_samples_ms_, 50)
+      << " assembly_p90_ms=" << PercentileMs(dgj_assembly_samples_ms_, 90)
+      << " assembly_p99_ms=" << PercentileMs(dgj_assembly_samples_ms_, 99)
+      << " assembly_max_ms=" << PercentileMs(dgj_assembly_samples_ms_, 100)
+      << " jitter_p50_ms=" << PercentileMs(dgj_jitter_samples_ms_, 50)
+      << " jitter_p90_ms=" << PercentileMs(dgj_jitter_samples_ms_, 90)
+      << " jitter_p99_ms=" << PercentileMs(dgj_jitter_samples_ms_, 99)
+      << " jitter_max_ms=" << PercentileMs(dgj_jitter_samples_ms_, 100)
+      << " decode_p50_ms=" << PercentileMs(dgj_decode_samples_ms_, 50)
+      << " decode_p90_ms=" << PercentileMs(dgj_decode_samples_ms_, 90)
+      << " decode_p99_ms=" << PercentileMs(dgj_decode_samples_ms_, 99)
+      << " decode_max_ms=" << PercentileMs(dgj_decode_samples_ms_, 100)
+      << " receive_to_decode_p50_ms="
+      << PercentileMs(dgj_receive_to_decode_samples_ms_, 50)
+      << " receive_to_decode_p90_ms="
+      << PercentileMs(dgj_receive_to_decode_samples_ms_, 90)
+      << " receive_to_decode_p99_ms="
+      << PercentileMs(dgj_receive_to_decode_samples_ms_, 99)
+      << " receive_to_decode_max_ms="
+      << PercentileMs(dgj_receive_to_decode_samples_ms_, 100);
+  dgj_receive_last_log_ms_ = now_ms;
+  dgj_assembly_samples_ms_.clear();
+  dgj_jitter_samples_ms_.clear();
+  dgj_decode_samples_ms_.clear();
+  dgj_receive_to_decode_samples_ms_.clear();
 }
 
 void VCMDecodedFrameCallback::OnDecoderInfoChanged(

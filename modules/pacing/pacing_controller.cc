@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,11 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "system_wrappers/include/clock.h"
+
+extern "C" __attribute__((visibility("default"), used)) const char*
+DuDeskRealtimeVideoPacerBuildMarker() {
+  return "DUDESK_REALTIME_VIDEO_PACER_FULL_FRAME_TIMING_V6";
+}
 
 namespace webrtc {
 namespace {
@@ -42,6 +48,16 @@ bool IsEnabled(const FieldTrialsView& field_trials, absl::string_view key) {
   return absl::StartsWith(field_trials.Lookup(key), "Enabled");
 }
 
+int64_t PercentileMs(std::vector<int64_t> samples, int percentile) {
+  if (samples.empty()) {
+    return -1;
+  }
+  std::sort(samples.begin(), samples.end());
+  const size_t index =
+      (samples.size() - 1) * static_cast<size_t>(percentile) / 100;
+  return samples[index];
+}
+
 }  // namespace
 
 const TimeDelta PacingController::kPausedProcessInterval =
@@ -52,6 +68,45 @@ const TimeDelta PacingController::kMaxPaddingReplayDuration =
     TimeDelta::Millis(50);
 const TimeDelta PacingController::kMaxEarlyProbeProcessing =
     TimeDelta::Millis(1);
+
+PacingController::RealtimeVideoPacerConfig
+PacingController::ParseRealtimeVideoPacerConfig(
+    const FieldTrialsView& field_trials) {
+  RealtimeVideoPacerConfig config;
+  const std::string trial = field_trials.Lookup("DuDesk-RealtimeVideoPacer");
+  config.enabled = absl::StartsWith(trial, "Enabled");
+  if (!config.enabled) {
+    return config;
+  }
+
+  FieldTrialConstrained<int> max_frame_burst_bytes(
+      "max_frame_burst_bytes",
+      static_cast<int>(config.max_frame_burst_size.bytes()),
+      static_cast<int>(kMaxBurstSize.bytes()), 512 * 1024);
+  FieldTrialConstrained<int> max_packet_group_bytes(
+      "max_packet_group_bytes",
+      static_cast<int>(config.max_packet_group_size.bytes()), 16 * 1024,
+      static_cast<int>(kMaxBurstSize.bytes()));
+  FieldTrialConstrained<int> packet_group_interval_ms(
+      "packet_group_interval_ms",
+      static_cast<int>(config.packet_group_interval.ms()), 1, 5);
+  FieldTrialConstrained<int> max_cross_frame_debt_ms(
+      "max_cross_frame_debt_ms",
+      static_cast<int>(config.max_cross_frame_debt.ms()), 0, 20);
+  const size_t parameter_start = trial.find(',');
+  if (parameter_start != std::string::npos) {
+    ParseFieldTrial({&max_frame_burst_bytes, &max_packet_group_bytes,
+                     &packet_group_interval_ms, &max_cross_frame_debt_ms},
+                    trial.substr(parameter_start + 1));
+  }
+  config.max_frame_burst_size = DataSize::Bytes(max_frame_burst_bytes.Get());
+  config.max_packet_group_size = DataSize::Bytes(max_packet_group_bytes.Get());
+  config.packet_group_interval =
+      TimeDelta::Millis(packet_group_interval_ms.Get());
+  config.max_cross_frame_debt =
+      TimeDelta::Millis(max_cross_frame_debt_ms.Get());
+  return config;
+}
 
 PacingController::PacingController(Clock* clock,
                                    PacketSender* packet_sender,
@@ -73,8 +128,36 @@ PacingController::PacingController(Clock* clock,
       keyframe_flushing_(
           configuration.keyframe_flushing ||
           IsEnabled(field_trials_, "WebRTC-Pacer-KeyframeFlushing")),
+      realtime_video_pacer_(ParseRealtimeVideoPacerConfig(field_trials_)),
       transport_overhead_per_packet_(DataSize::Zero()),
       send_burst_interval_(configuration.send_burst_interval),
+      realtime_video_last_log_time_(clock_->CurrentTime()),
+      realtime_video_frame_bursts_(0),
+      realtime_video_frame_packets_(0),
+      realtime_video_frame_bytes_(0),
+      realtime_video_max_frame_bytes_(DataSize::Zero()),
+      realtime_video_packet_groups_(0),
+      realtime_video_continuation_wakeups_(0),
+      realtime_video_frame_cap_hits_(0),
+      realtime_video_max_packet_group_bytes_(DataSize::Zero()),
+      realtime_video_max_frame_send_span_(TimeDelta::Zero()),
+      realtime_video_max_capture_to_first_send_(TimeDelta::Zero()),
+      realtime_video_max_capture_to_last_send_(TimeDelta::Zero()),
+      realtime_video_debt_clamps_(0),
+      realtime_video_debt_reduction_bytes_(0),
+      realtime_video_max_debt_before_clamp_(TimeDelta::Zero()),
+      realtime_video_max_debt_after_clamp_(TimeDelta::Zero()),
+      realtime_video_continuation_pending_(false),
+      realtime_video_continuation_ssrc_(0),
+      realtime_video_continuation_timestamp_(0),
+      realtime_video_continuation_send_time_(Timestamp::MinusInfinity()),
+      realtime_video_cross_frame_send_time_(Timestamp::MinusInfinity()),
+      realtime_video_active_frame_bytes_(DataSize::Zero()),
+      realtime_video_active_frame_packets_(0),
+      realtime_video_active_packet_groups_(0),
+      realtime_video_active_max_packet_group_bytes_(DataSize::Zero()),
+      realtime_video_active_first_send_time_(Timestamp::MinusInfinity()),
+      realtime_video_active_capture_time_(Timestamp::MinusInfinity()),
       last_timestamp_(clock_->CurrentTime()),
       paused_(false),
       media_debt_(DataSize::Zero()),
@@ -98,6 +181,20 @@ PacingController::PacingController(Clock* clock,
   if (!drain_large_queues_) {
     RTC_LOG(LS_WARNING) << "Pacer queues will not be drained,"
                            "pushback experiment must be enabled.";
+  }
+  if (realtime_video_pacer_.enabled) {
+    RTC_LOG(LS_INFO)
+        << "DUDESK_REALTIME_VIDEO_PACER enabled=1 mode=controlled-packet-groups"
+        << " debt_window_ms=" << send_burst_interval_.ms()
+        << " stock_burst_cap_bytes=" << kMaxBurstSize.bytes()
+        << " max_frame_burst_bytes="
+        << realtime_video_pacer_.max_frame_burst_size.bytes()
+        << " max_packet_group_bytes="
+        << realtime_video_pacer_.max_packet_group_size.bytes()
+        << " packet_group_interval_ms="
+        << realtime_video_pacer_.packet_group_interval.ms()
+        << " max_cross_frame_debt_ms="
+        << realtime_video_pacer_.max_cross_frame_debt.ms();
   }
 }
 
@@ -347,6 +444,18 @@ Timestamp PacingController::NextSendTime() const {
     return last_send_time_ + kCongestedPacketInterval;
   }
 
+  if (IsRealtimeVideoFrameContinuationPending()) {
+    return realtime_video_continuation_send_time_;
+  }
+
+  const RtpPacketToSend* next_packet = packet_queue_.Peek();
+  if (realtime_video_pacer_.enabled && next_packet != nullptr &&
+      next_packet->packet_type() == RtpPacketMediaType::kVideo &&
+      realtime_video_cross_frame_send_time_.IsFinite() &&
+      now < realtime_video_cross_frame_send_time_) {
+    return realtime_video_cross_frame_send_time_;
+  }
+
   if (adjusted_media_rate_ > DataRate::Zero() && !packet_queue_.Empty()) {
     // If packets are allowed to be sent in a burst, the
     // debt is allowed to grow up to one packet more than what can be sent
@@ -385,6 +494,19 @@ Timestamp PacingController::NextSendTime() const {
   }
 
   return next_send_time;
+}
+
+bool PacingController::IsRealtimeVideoFrameContinuationPending() const {
+  if (!realtime_video_pacer_.enabled || !realtime_video_continuation_pending_ ||
+      congested_) {
+    return false;
+  }
+
+  const RtpPacketToSend* next_packet = packet_queue_.Peek();
+  return next_packet != nullptr &&
+         next_packet->packet_type() == RtpPacketMediaType::kVideo &&
+         next_packet->Ssrc() == realtime_video_continuation_ssrc_ &&
+         next_packet->Timestamp() == realtime_video_continuation_timestamp_;
 }
 
 void PacingController::ProcessPackets() {
@@ -454,6 +576,17 @@ void PacingController::ProcessPackets() {
   int iteration = 0;
   int packets_sent = 0;
   int padding_packets_generated = 0;
+  bool realtime_video_frame_burst_extended = false;
+  DataSize realtime_video_packet_group_bytes = DataSize::Zero();
+  int realtime_video_packet_group_packets = 0;
+  Timestamp realtime_video_packet_group_last_send = Timestamp::MinusInfinity();
+  bool realtime_video_group_continuation_scheduled = false;
+  bool realtime_video_frame_complete = false;
+
+  if (IsRealtimeVideoFrameContinuationPending()) {
+    realtime_video_continuation_pending_ = false;
+    ++realtime_video_continuation_wakeups_;
+  }
   for (; iteration < circuit_breaker_threshold_; ++iteration) {
     // Fetch packet, so long as queue is not empty or budget is not
     // exhausted.
@@ -492,6 +625,12 @@ void PacingController::ProcessPackets() {
       RTC_DCHECK(rtp_packet);
       RTC_DCHECK(rtp_packet->packet_type().has_value());
       const RtpPacketMediaType packet_type = *rtp_packet->packet_type();
+      const uint32_t packet_ssrc = rtp_packet->Ssrc();
+      const uint32_t packet_timestamp = rtp_packet->Timestamp();
+      const bool packet_marker = rtp_packet->Marker();
+      const absl::optional<Timestamp> packet_encode_finish_time =
+          rtp_packet->frame_encode_finish_time();
+      const Timestamp packet_capture_time = rtp_packet->capture_time();
       DataSize packet_size = DataSize::Bytes(rtp_packet->payload_size() +
                                              rtp_packet->padding_size());
 
@@ -500,12 +639,37 @@ void PacingController::ProcessPackets() {
                        transport_overhead_per_packet_;
       }
 
+      const Timestamp packet_send_start = CurrentTime();
       packet_sender_->SendPacket(std::move(rtp_packet), pacing_info);
+      const Timestamp packet_send_end = CurrentTime();
       for (auto& packet : packet_sender_->FetchFec()) {
         EnqueuePacket(std::move(packet));
       }
       data_sent += packet_size;
       ++packets_sent;
+      if (packet_type == RtpPacketMediaType::kVideo) {
+        if (realtime_video_pacer_.enabled && !is_probing) {
+          if (realtime_video_active_frame_ssrc_ != packet_ssrc ||
+              realtime_video_active_frame_timestamp_ != packet_timestamp) {
+            ResetRealtimeVideoFrameState();
+            realtime_video_active_frame_ssrc_ = packet_ssrc;
+            realtime_video_active_frame_timestamp_ = packet_timestamp;
+            realtime_video_active_first_send_time_ = packet_send_start;
+            realtime_video_active_capture_time_ = packet_capture_time;
+            if (packet_encode_finish_time) {
+              realtime_video_active_encode_finish_time_ =
+                  *packet_encode_finish_time;
+            }
+          }
+          realtime_video_active_frame_bytes_ += packet_size;
+          realtime_video_active_burst_bytes_ += packet_size;
+          ++realtime_video_active_frame_packets_;
+          realtime_video_packet_group_bytes += packet_size;
+          ++realtime_video_packet_group_packets;
+          realtime_video_packet_group_last_send = packet_send_end;
+          realtime_video_frame_burst_extended = true;
+        }
+      }
 
       // Send done, update send time.
       OnPacketSent(packet_type, packet_size, now);
@@ -522,12 +686,53 @@ void PacingController::ProcessPackets() {
       // Update target send time in case that are more packets that we are late
       // in processing.
       target_send_time = NextSendTime();
-      if (target_send_time > now) {
+      if (packet_type == RtpPacketMediaType::kVideo && packet_marker &&
+          realtime_video_pacer_.enabled && !is_probing) {
+        realtime_video_frame_complete = true;
+        break;
+      }
+      if (realtime_video_pacer_.enabled && !is_probing &&
+          realtime_video_active_frame_ssrc_ == packet_ssrc &&
+          realtime_video_active_frame_timestamp_ == packet_timestamp) {
+        absl::optional<DataSize> next_packet_size =
+            NextRealtimeVideoPacketSize(packet_ssrc, packet_timestamp);
+        if (!next_packet_size) {
+          realtime_video_frame_complete = true;
+          break;
+        }
+        if (realtime_video_active_burst_bytes_ + *next_packet_size >
+            realtime_video_pacer_.max_frame_burst_size) {
+          realtime_video_active_burst_bytes_ = DataSize::Zero();
+          realtime_video_continuation_pending_ = true;
+          realtime_video_continuation_ssrc_ = packet_ssrc;
+          realtime_video_continuation_timestamp_ = packet_timestamp;
+          realtime_video_continuation_send_time_ =
+              CurrentTime() + realtime_video_pacer_.max_cross_frame_debt;
+          realtime_video_group_continuation_scheduled = true;
+          ClampRealtimeVideoMediaDebtAfterFrameBurst();
+          ++realtime_video_frame_cap_hits_;
+          break;
+        }
+        if (realtime_video_packet_group_bytes + *next_packet_size >
+            realtime_video_pacer_.max_packet_group_size) {
+          realtime_video_continuation_pending_ = true;
+          realtime_video_continuation_ssrc_ = packet_ssrc;
+          realtime_video_continuation_timestamp_ = packet_timestamp;
+          realtime_video_continuation_send_time_ =
+              CurrentTime() + realtime_video_pacer_.packet_group_interval;
+          realtime_video_group_continuation_scheduled = true;
+          break;
+        }
+        if (target_send_time > now) {
+          target_send_time = now;
+        }
+      } else if (target_send_time > now) {
         // Exit loop if not probing.
         if (!is_probing) {
           break;
+        } else {
+          target_send_time = now;
         }
-        target_send_time = now;
       }
       UpdateBudgetWithElapsedTime(UpdateTimeAndGetElapsed(target_send_time));
     }
@@ -560,6 +765,57 @@ void PacingController::ProcessPackets() {
     last_send_time_ = now;
     last_process_time_ = now;
     return;
+  }
+
+  if (realtime_video_frame_burst_extended) {
+    if (realtime_video_packet_group_packets > 0) {
+      ++realtime_video_active_packet_groups_;
+      realtime_video_active_max_packet_group_bytes_ =
+          std::max(realtime_video_active_max_packet_group_bytes_,
+                   realtime_video_packet_group_bytes);
+    }
+    if (realtime_video_frame_complete &&
+        !realtime_video_group_continuation_scheduled) {
+      ClampRealtimeVideoMediaDebtAfterFrameBurst();
+      realtime_video_cross_frame_send_time_ =
+          CurrentTime() + realtime_video_pacer_.max_cross_frame_debt;
+      const Timestamp frame_last_send =
+          realtime_video_packet_group_last_send.IsFinite()
+              ? realtime_video_packet_group_last_send
+              : CurrentTime();
+      const TimeDelta frame_send_span =
+          realtime_video_active_first_send_time_.IsFinite()
+              ? std::max(
+                    TimeDelta::Zero(),
+                    frame_last_send - realtime_video_active_first_send_time_)
+              : TimeDelta::Zero();
+      const TimeDelta capture_to_first_send =
+          realtime_video_active_capture_time_.IsFinite() &&
+                  realtime_video_active_first_send_time_ >=
+                      realtime_video_active_capture_time_
+              ? realtime_video_active_first_send_time_ -
+                    realtime_video_active_capture_time_
+              : TimeDelta::Zero();
+      const TimeDelta capture_to_last_send =
+          realtime_video_active_capture_time_.IsFinite() &&
+                  frame_last_send >= realtime_video_active_capture_time_
+              ? frame_last_send - realtime_video_active_capture_time_
+              : TimeDelta::Zero();
+      absl::optional<TimeDelta> encode_finish_to_last_send;
+      if (realtime_video_active_encode_finish_time_.IsFinite() &&
+          frame_last_send >= realtime_video_active_encode_finish_time_) {
+        encode_finish_to_last_send =
+            frame_last_send - realtime_video_active_encode_finish_time_;
+      }
+      MaybeLogRealtimeVideoFrameBurst(
+          CurrentTime(), realtime_video_active_frame_bytes_,
+          realtime_video_active_frame_packets_,
+          realtime_video_active_packet_groups_,
+          realtime_video_active_max_packet_group_bytes_, frame_send_span,
+          capture_to_first_send, capture_to_last_send,
+          encode_finish_to_last_send);
+      ResetRealtimeVideoFrameState();
+    }
   }
 
   if (is_probing) {
@@ -723,6 +979,161 @@ Timestamp PacingController::NextUnpacedSendTime() const {
     }
   }
   return Timestamp::MinusInfinity();
+}
+
+absl::optional<DataSize> PacingController::NextRealtimeVideoPacketSize(
+    uint32_t ssrc,
+    uint32_t rtp_timestamp) const {
+  const RtpPacketToSend* next_packet = packet_queue_.Peek();
+  if (next_packet == nullptr ||
+      next_packet->packet_type() != RtpPacketMediaType::kVideo ||
+      next_packet->Ssrc() != ssrc ||
+      next_packet->Timestamp() != rtp_timestamp) {
+    return absl::nullopt;
+  }
+
+  DataSize next_packet_size = DataSize::Bytes(next_packet->payload_size() +
+                                              next_packet->padding_size());
+  if (include_overhead_) {
+    next_packet_size += DataSize::Bytes(next_packet->headers_size()) +
+                        transport_overhead_per_packet_;
+  }
+  return next_packet_size;
+}
+
+void PacingController::ClampRealtimeVideoMediaDebtAfterFrameBurst() {
+  if (adjusted_media_rate_ <= DataRate::Zero()) {
+    return;
+  }
+
+  const DataSize max_cross_frame_debt = std::min(
+      adjusted_media_rate_ * realtime_video_pacer_.max_cross_frame_debt,
+      kMaxBurstSize);
+  if (media_debt_ <= max_cross_frame_debt) {
+    return;
+  }
+
+  const DataSize debt_before_clamp = media_debt_;
+  const TimeDelta debt_before_time = media_debt_ / adjusted_media_rate_;
+  media_debt_ = max_cross_frame_debt;
+  const TimeDelta debt_after_time = media_debt_ / adjusted_media_rate_;
+
+  ++realtime_video_debt_clamps_;
+  realtime_video_debt_reduction_bytes_ +=
+      (debt_before_clamp - media_debt_).bytes();
+  realtime_video_max_debt_before_clamp_ =
+      std::max(realtime_video_max_debt_before_clamp_, debt_before_time);
+  realtime_video_max_debt_after_clamp_ =
+      std::max(realtime_video_max_debt_after_clamp_, debt_after_time);
+}
+
+void PacingController::ResetRealtimeVideoFrameState() {
+  realtime_video_continuation_pending_ = false;
+  realtime_video_continuation_ssrc_ = 0;
+  realtime_video_continuation_timestamp_ = 0;
+  realtime_video_continuation_send_time_ = Timestamp::MinusInfinity();
+  realtime_video_active_frame_ssrc_.reset();
+  realtime_video_active_frame_timestamp_.reset();
+  realtime_video_active_frame_bytes_ = DataSize::Zero();
+  realtime_video_active_burst_bytes_ = DataSize::Zero();
+  realtime_video_active_frame_packets_ = 0;
+  realtime_video_active_packet_groups_ = 0;
+  realtime_video_active_max_packet_group_bytes_ = DataSize::Zero();
+  realtime_video_active_first_send_time_ = Timestamp::MinusInfinity();
+  realtime_video_active_capture_time_ = Timestamp::MinusInfinity();
+  realtime_video_active_encode_finish_time_ = Timestamp::MinusInfinity();
+}
+
+void PacingController::MaybeLogRealtimeVideoFrameBurst(
+    Timestamp now,
+    DataSize frame_bytes,
+    int frame_packets,
+    int packet_groups,
+    DataSize max_packet_group_bytes,
+    TimeDelta frame_send_span,
+    TimeDelta capture_to_first_send,
+    TimeDelta capture_to_last_send,
+    absl::optional<TimeDelta> encode_finish_to_last_send) {
+  ++realtime_video_frame_bursts_;
+  realtime_video_frame_packets_ += frame_packets;
+  realtime_video_frame_bytes_ += frame_bytes.bytes();
+  realtime_video_max_frame_bytes_ =
+      std::max(realtime_video_max_frame_bytes_, frame_bytes);
+  realtime_video_packet_groups_ += packet_groups;
+  realtime_video_max_packet_group_bytes_ =
+      std::max(realtime_video_max_packet_group_bytes_, max_packet_group_bytes);
+  realtime_video_max_frame_send_span_ =
+      std::max(realtime_video_max_frame_send_span_, frame_send_span);
+  realtime_video_max_capture_to_first_send_ = std::max(
+      realtime_video_max_capture_to_first_send_, capture_to_first_send);
+  realtime_video_max_capture_to_last_send_ =
+      std::max(realtime_video_max_capture_to_last_send_, capture_to_last_send);
+  if (encode_finish_to_last_send) {
+    realtime_video_max_encode_finish_to_last_send_ =
+        std::max(realtime_video_max_encode_finish_to_last_send_,
+                 *encode_finish_to_last_send);
+    realtime_video_encode_to_last_samples_ms_.push_back(
+        encode_finish_to_last_send->ms());
+  }
+
+  if (now - realtime_video_last_log_time_ < TimeDelta::Seconds(1)) {
+    return;
+  }
+
+  RTC_LOG(LS_INFO)
+      << "DUDESK_REALTIME_VIDEO_PACER frame_bursts="
+      << realtime_video_frame_bursts_
+      << " last_rtp_ts="
+      << (realtime_video_active_frame_timestamp_.has_value()
+              ? std::to_string(*realtime_video_active_frame_timestamp_)
+              : std::string("-1"))
+      << " frame_packets=" << realtime_video_frame_packets_
+      << " frame_bytes=" << realtime_video_frame_bytes_
+      << " max_frame_bytes=" << realtime_video_max_frame_bytes_.bytes()
+      << " packet_groups=" << realtime_video_packet_groups_
+      << " continuation_wakeups=" << realtime_video_continuation_wakeups_
+      << " frame_cap_hits=" << realtime_video_frame_cap_hits_
+      << " max_group_bytes=" << realtime_video_max_packet_group_bytes_.bytes()
+      << " max_frame_send_span_ms=" << realtime_video_max_frame_send_span_.ms()
+      << " max_capture_to_first_send_ms="
+      << realtime_video_max_capture_to_first_send_.ms()
+      << " max_capture_to_last_send_ms="
+      << realtime_video_max_capture_to_last_send_.ms()
+      << " encode_to_last_samples="
+      << realtime_video_encode_to_last_samples_ms_.size()
+      << " encode_to_last_p50_ms="
+      << PercentileMs(realtime_video_encode_to_last_samples_ms_, 50)
+      << " encode_to_last_p90_ms="
+      << PercentileMs(realtime_video_encode_to_last_samples_ms_, 90)
+      << " encode_to_last_p99_ms="
+      << PercentileMs(realtime_video_encode_to_last_samples_ms_, 99)
+      << " max_encode_to_last_ms="
+      << realtime_video_max_encode_finish_to_last_send_.ms()
+      << " debt_clamps=" << realtime_video_debt_clamps_
+      << " debt_reduction_bytes=" << realtime_video_debt_reduction_bytes_
+      << " max_debt_before_ms=" << realtime_video_max_debt_before_clamp_.ms()
+      << " max_debt_after_ms=" << realtime_video_max_debt_after_clamp_.ms()
+      << " queue_packets=" << packet_queue_.SizeInPackets()
+      << " queue_bytes=" << packet_queue_.SizeInPayloadBytes().bytes()
+      << " congested=" << (congested_ ? 1 : 0);
+  realtime_video_last_log_time_ = now;
+  realtime_video_frame_bursts_ = 0;
+  realtime_video_frame_packets_ = 0;
+  realtime_video_frame_bytes_ = 0;
+  realtime_video_max_frame_bytes_ = DataSize::Zero();
+  realtime_video_packet_groups_ = 0;
+  realtime_video_continuation_wakeups_ = 0;
+  realtime_video_frame_cap_hits_ = 0;
+  realtime_video_max_packet_group_bytes_ = DataSize::Zero();
+  realtime_video_max_frame_send_span_ = TimeDelta::Zero();
+  realtime_video_max_capture_to_first_send_ = TimeDelta::Zero();
+  realtime_video_max_capture_to_last_send_ = TimeDelta::Zero();
+  realtime_video_max_encode_finish_to_last_send_ = TimeDelta::Zero();
+  realtime_video_encode_to_last_samples_ms_.clear();
+  realtime_video_debt_clamps_ = 0;
+  realtime_video_debt_reduction_bytes_ = 0;
+  realtime_video_max_debt_before_clamp_ = TimeDelta::Zero();
+  realtime_video_max_debt_after_clamp_ = TimeDelta::Zero();
 }
 
 }  // namespace webrtc

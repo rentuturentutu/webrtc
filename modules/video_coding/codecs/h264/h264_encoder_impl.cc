@@ -633,6 +633,16 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
   // `uiIntraPeriod`    - multiple of GOP size
   // `keyFrameInterval` - number of frames
   encoder_params.uiIntraPeriod = configurations_[i].key_frame_interval;
+  // Screen-sharing / remote-desktop tuning: stretch the intra period so we
+  // don't burn relay bandwidth on periodic keyframes; rely on NACK/PLI for
+  // recovery. Encoder frame skipping is deliberately left enabled -- for a
+  // latency-first remote desktop, dropping a frame is cheaper than letting it
+  // queue up in the pacer.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    if (encoder_params.uiIntraPeriod < 600) {
+      encoder_params.uiIntraPeriod = 600;
+    }
+  }
   // Reuse SPS id if possible. This helps to avoid reset of chromium HW decoder
   // on each key-frame.
   // Note that WebRTC resets encoder on resolution change which makes all

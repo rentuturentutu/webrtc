@@ -241,7 +241,9 @@ void TaskQueuePacedSender::MaybeProcessPackets(
 
   // Do not hold back in probing.
   TimeDelta hold_back_window = TimeDelta::Zero();
-  if (!pacing_controller_.IsProbing()) {
+  const bool realtime_video_continuation =
+      pacing_controller_.IsRealtimeVideoFrameContinuationPending();
+  if (!pacing_controller_.IsProbing() && !realtime_video_continuation) {
     hold_back_window = max_hold_back_window_;
     DataRate pacing_rate = pacing_controller_.pacing_rate();
     if (max_hold_back_window_in_packets_ != kNoPacketHoldback &&
@@ -256,8 +258,9 @@ void TaskQueuePacedSender::MaybeProcessPackets(
   }
 
   // Calculate next process time.
-  TimeDelta time_to_next_process =
-      std::max(hold_back_window, next_send_time - now - early_execute_margin);
+  TimeDelta time_to_next_process = std::max(
+      TimeDelta::Zero(),
+      std::max(hold_back_window, next_send_time - now - early_execute_margin));
   next_send_time = now + time_to_next_process;
 
   // If no in flight task or in flight task is later than `next_send_time`,

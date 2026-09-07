@@ -649,6 +649,13 @@ int LibvpxVp9Encoder::InitEncode(const VideoCodec* inst,
   config_->g_h = codec_.height;
   config_->rc_target_bitrate = inst->startBitrate;  // in kbit/s
   config_->g_error_resilient = is_svc_ ? VPX_ERROR_RESILIENT_DEFAULT : 0;
+  // For screen sharing / remote desktop on lossy relay paths, enable error
+  // resilience so a single lost packet does not propagate visible freezes
+  // through subsequent frames.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    config_->g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+  }
+
   // Setting the time base of the codec.
   config_->g_timebase.num = 1;
   config_->g_timebase.den = 90000;

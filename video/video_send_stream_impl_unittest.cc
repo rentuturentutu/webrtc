@@ -533,6 +533,37 @@ TEST_F(VideoSendStreamImplTest, DoesNotSetPacingFactorWithoutFeedback) {
   vss_impl->Stop();
 }
 
+// Remote desktop is latency-first: the pacer queue limit for screen content is
+// capped so congestion drops frames instead of building a stale backlog.
+TEST_F(VideoSendStreamImplTest, CapsPacerQueueTimeLimitForScreenContent) {
+  constexpr int kScreenshareMaxPacingDelayMs = 250;
+  constexpr int kId = 1;
+  config_.rtp.extensions.emplace_back(RtpExtension::kTransportSequenceNumberUri,
+                                      kId);
+  EXPECT_CALL(transport_controller_,
+              SetQueueTimeLimit(kScreenshareMaxPacingDelayMs))
+      .Times(1);
+  auto vss_impl = CreateVideoSendStreamImpl(
+      TestVideoEncoderConfig(VideoEncoderConfig::ContentType::kScreen));
+  vss_impl->Start();
+  vss_impl->Stop();
+}
+
+TEST_F(VideoSendStreamImplTest, DoesNotCapPacerQueueTimeLimitForCamera) {
+  constexpr int kScreenshareMaxPacingDelayMs = 250;
+  constexpr int kId = 1;
+  config_.rtp.extensions.emplace_back(RtpExtension::kTransportSequenceNumberUri,
+                                      kId);
+  EXPECT_CALL(transport_controller_,
+              SetQueueTimeLimit(::testing::Gt(kScreenshareMaxPacingDelayMs)))
+      .Times(1);
+  auto vss_impl = CreateVideoSendStreamImpl(
+      TestVideoEncoderConfig(VideoEncoderConfig::ContentType::kRealtimeVideo));
+  vss_impl->Start();
+  vss_impl->Stop();
+}
+
+
 TEST_F(VideoSendStreamImplTest, ForwardsVideoBitrateAllocationWhenEnabled) {
   auto vss_impl = CreateVideoSendStreamImpl(
       TestVideoEncoderConfig(VideoEncoderConfig::ContentType::kScreen));

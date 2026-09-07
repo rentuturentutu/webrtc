@@ -58,9 +58,21 @@ VCMTiming::VCMTiming(Clock* clock, const FieldTrialsView& field_trials)
       num_decoded_frames_(0),
       zero_playout_delay_min_pacing_("min_pacing",
                                      kZeroPlayoutDelayDefaultMinPacing),
-      last_decode_scheduled_(Timestamp::Zero()) {
+      last_decode_scheduled_(Timestamp::Zero()),
+      force_low_latency_(
+          field_trials.IsEnabled("WebRTC-DgjForceLowLatency")) {
   ParseFieldTrial({&zero_playout_delay_min_pacing_},
                   field_trials.Lookup("WebRTC-ZeroPlayoutDelay"));
+  if (force_low_latency_) {
+    // The default range is [0, 10s] while the low-latency threshold is 500ms,
+    // so without this the low-latency path is off unless the sender's
+    // playout-delay header extension arrives and narrows the range. Pinning it
+    // here removes that dependency on signalling entirely.
+    min_playout_delay_ = TimeDelta::Zero();
+    max_playout_delay_ = TimeDelta::Zero();
+    RTC_LOG(LS_INFO) << "VCMTiming: forcing low-latency rendering, playout "
+                        "delay pinned to [0, 0]";
+  }
 }
 
 void VCMTiming::Reset() {
@@ -86,6 +98,10 @@ TimeDelta VCMTiming::min_playout_delay() const {
 
 void VCMTiming::set_min_playout_delay(TimeDelta min_playout_delay) {
   MutexLock lock(&mutex_);
+  if (force_low_latency_) {
+    // Pinned to zero; ignore the playout-delay extension and A/V sync.
+    return;
+  }
   if (min_playout_delay_ != min_playout_delay) {
     CheckDelaysValid(min_playout_delay, max_playout_delay_);
     min_playout_delay_ = min_playout_delay;
@@ -94,6 +110,10 @@ void VCMTiming::set_min_playout_delay(TimeDelta min_playout_delay) {
 
 void VCMTiming::set_max_playout_delay(TimeDelta max_playout_delay) {
   MutexLock lock(&mutex_);
+  if (force_low_latency_) {
+    // Pinned to zero; ignore the playout-delay extension and A/V sync.
+    return;
+  }
   if (max_playout_delay_ != max_playout_delay) {
     CheckDelaysValid(min_playout_delay_, max_playout_delay);
     max_playout_delay_ = max_playout_delay;

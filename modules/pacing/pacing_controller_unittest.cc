@@ -472,6 +472,148 @@ TEST_F(PacingControllerTest, DefaultBudgetDoesNotAffectAudio) {
   pacer.ProcessPackets();
 }
 
+TEST_F(PacingControllerTest, DuDeskFrameBurstIsDisabledByDefault) {
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 3; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 1000);
+    packet->SetTimestamp(9000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(1);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 2u);
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstFinishesCurrentRtpFrame) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:262144/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 3; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 1000);
+    packet->SetTimestamp(9000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(3);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 0u);
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstClampsCrossFrameDebt) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:262144/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 6; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 1000);
+    packet->SetTimestamp(sequence_number <= 3 ? 9000 : 18000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(3);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 3u);
+  EXPECT_EQ(pacer.CurrentBufferLevel(), DataSize::Bytes(60));
+  EXPECT_EQ(pacer.NextSendTime() - clock_.CurrentTime(), TimeDelta::Millis(6));
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstUsesControlledPacketGroups) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:262144,"
+      "max_packet_group_bytes:49152,packet_group_interval_ms:1,"
+      "max_cross_frame_debt_ms:6/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 4; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 20000);
+    packet->SetTimestamp(9000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(2);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 2u);
+  EXPECT_TRUE(pacer.IsRealtimeVideoFrameContinuationPending());
+  EXPECT_EQ(pacer.NextSendTime() - clock_.CurrentTime(), TimeDelta::Millis(1));
+
+  clock_.AdvanceTimeMilliseconds(1);
+  EXPECT_CALL(callback_, SendPacket).Times(2);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 0u);
+  EXPECT_FALSE(pacer.IsRealtimeVideoFrameContinuationPending());
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstDoesNotCrossRtpFrames) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:262144/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 2; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 1000);
+    packet->SetTimestamp(sequence_number * 9000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(1);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 1u);
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstHonorsConfiguredByteCap) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:63000,"
+      "max_packet_group_bytes:63000/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+
+  for (uint16_t sequence_number = 1; sequence_number <= 3; ++sequence_number) {
+    auto packet =
+        BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, sequence_number,
+                    clock_.TimeInMilliseconds(), 30000);
+    packet->SetTimestamp(9000);
+    pacer.EnqueuePacket(std::move(packet));
+  }
+
+  EXPECT_CALL(callback_, SendPacket).Times(2);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 1u);
+}
+
+TEST_F(PacingControllerTest, DuDeskFrameBurstStillHonorsCongestion) {
+  ExplicitKeyValueConfig trials(
+      "DuDesk-RealtimeVideoPacer/Enabled,max_frame_burst_bytes:262144/");
+  PacingController pacer(&clock_, &callback_, trials);
+  pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+  pacer.SetCongested(true);
+
+  auto packet = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 1,
+                            clock_.TimeInMilliseconds(), 1000);
+  packet->SetTimestamp(9000);
+  pacer.EnqueuePacket(std::move(packet));
+
+  EXPECT_CALL(callback_, SendPacket).Times(0);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), 1u);
+}
+
 TEST_F(PacingControllerTest, FirstSentPacketTimeIsSet) {
   const Timestamp kStartTime = clock_.CurrentTime();
   auto pacer = std::make_unique<PacingController>(&clock_, &callback_, trials_);

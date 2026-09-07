@@ -195,6 +195,9 @@ class PacingController {
   // Returns the next time we expect ProcessPackets() to be called.
   Timestamp NextSendTime() const;
 
+  // A DuDesk RTP frame has more packet groups ready for high-precision send.
+  bool IsRealtimeVideoFrameContinuationPending() const;
+
   // Check queue of pending packets and send them or padding packets, if budget
   // is available.
   void ProcessPackets();
@@ -210,6 +213,17 @@ class PacingController {
   void RemovePacketsForSsrc(uint32_t ssrc);
 
  private:
+  struct RealtimeVideoPacerConfig {
+    bool enabled = false;
+    DataSize max_frame_burst_size = DataSize::Bytes(256 * 1024);
+    DataSize max_packet_group_size = DataSize::Bytes(48 * 1024);
+    TimeDelta packet_group_interval = TimeDelta::Millis(1);
+    TimeDelta max_cross_frame_debt = TimeDelta::Millis(6);
+  };
+
+  static RealtimeVideoPacerConfig ParseRealtimeVideoPacerConfig(
+      const FieldTrialsView& field_trials);
+
   TimeDelta UpdateTimeAndGetElapsed(Timestamp now);
   bool ShouldSendKeepalive(Timestamp now) const;
 
@@ -237,6 +251,21 @@ class PacingController {
   // least one packet of that type. Otherwise returns
   // Timestamp::MinusInfinity().
   Timestamp NextUnpacedSendTime() const;
+  absl::optional<DataSize> NextRealtimeVideoPacketSize(
+      uint32_t ssrc,
+      uint32_t rtp_timestamp) const;
+  void ClampRealtimeVideoMediaDebtAfterFrameBurst();
+  void ResetRealtimeVideoFrameState();
+  void MaybeLogRealtimeVideoFrameBurst(Timestamp now,
+                                       DataSize frame_bytes,
+                                       int frame_packets,
+                                       int packet_groups,
+                                       DataSize max_packet_group_bytes,
+                                       TimeDelta frame_send_span,
+                                       TimeDelta capture_to_first_send,
+                                       TimeDelta capture_to_last_send,
+                                       absl::optional<TimeDelta>
+                                           encode_finish_to_last_send);
 
   Clock* const clock_;
   PacketSender* const packet_sender_;
@@ -248,9 +277,44 @@ class PacingController {
   const bool ignore_transport_overhead_;
   const bool fast_retransmissions_;
   const bool keyframe_flushing_;
+  const RealtimeVideoPacerConfig realtime_video_pacer_;
   DataRate max_rate = DataRate::BitsPerSec(100'000'000);
   DataSize transport_overhead_per_packet_;
   TimeDelta send_burst_interval_;
+  Timestamp realtime_video_last_log_time_;
+  uint64_t realtime_video_frame_bursts_;
+  uint64_t realtime_video_frame_packets_;
+  uint64_t realtime_video_frame_bytes_;
+  DataSize realtime_video_max_frame_bytes_;
+  uint64_t realtime_video_packet_groups_;
+  uint64_t realtime_video_continuation_wakeups_;
+  uint64_t realtime_video_frame_cap_hits_;
+  DataSize realtime_video_max_packet_group_bytes_;
+  TimeDelta realtime_video_max_frame_send_span_;
+  TimeDelta realtime_video_max_capture_to_first_send_;
+  TimeDelta realtime_video_max_capture_to_last_send_;
+  TimeDelta realtime_video_max_encode_finish_to_last_send_ = TimeDelta::Zero();
+  std::vector<int64_t> realtime_video_encode_to_last_samples_ms_;
+  uint64_t realtime_video_debt_clamps_;
+  uint64_t realtime_video_debt_reduction_bytes_;
+  TimeDelta realtime_video_max_debt_before_clamp_;
+  TimeDelta realtime_video_max_debt_after_clamp_;
+  bool realtime_video_continuation_pending_;
+  uint32_t realtime_video_continuation_ssrc_;
+  uint32_t realtime_video_continuation_timestamp_;
+  Timestamp realtime_video_continuation_send_time_;
+  Timestamp realtime_video_cross_frame_send_time_;
+  absl::optional<uint32_t> realtime_video_active_frame_ssrc_;
+  absl::optional<uint32_t> realtime_video_active_frame_timestamp_;
+  DataSize realtime_video_active_frame_bytes_;
+  DataSize realtime_video_active_burst_bytes_ = DataSize::Zero();
+  int realtime_video_active_frame_packets_;
+  int realtime_video_active_packet_groups_;
+  DataSize realtime_video_active_max_packet_group_bytes_;
+  Timestamp realtime_video_active_first_send_time_;
+  Timestamp realtime_video_active_capture_time_;
+  Timestamp realtime_video_active_encode_finish_time_ =
+      Timestamp::MinusInfinity();
 
   // TODO(webrtc:9716): Remove this when we are certain clocks are monotonic.
   // The last millisecond timestamp returned by `clock_`.

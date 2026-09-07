@@ -17,6 +17,7 @@
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "api/rtp_headers.h"
+#include "api/units/timestamp.h"
 #include "api/transport/rtp/dependency_descriptor.h"
 #include "api/video/color_space.h"
 #include "api/video/video_codec_type.h"
@@ -84,6 +85,9 @@ struct RTPVideoHeader {
 
   absl::optional<VideoPlayoutDelay> playout_delay;
   VideoSendTiming video_timing;
+  // Local-only metadata. RTPSenderVideo copies it into every packet so the
+  // pacer can measure the complete frame without adding RTP header bytes.
+  absl::optional<Timestamp> encode_finish_time;
   absl::optional<ColorSpace> color_space;
   // This field is meant for media quality testing purpose only. When enabled it
   // carries the webrtc::VideoFrame id field from the sender to the receiver.

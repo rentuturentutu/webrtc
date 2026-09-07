@@ -78,3 +78,8 @@
 /node_modules
 /libwebrtc
 /args.txt
+
+
+out - 副本
+/src/sdk/objc/api/native/src/*
+/sdk/objc/api/native/src/*

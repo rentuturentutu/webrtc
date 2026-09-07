@@ -15,6 +15,7 @@
 #include <deque>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "api/field_trials_view.h"
 #include "api/sequence_checker.h"
@@ -73,6 +74,10 @@ class VCMDecodedFrameCallback : public DecodedImageCallback {
  private:
   std::pair<absl::optional<FrameInfo>, size_t> FindFrameInfo(
       uint32_t rtp_timestamp) RTC_EXCLUSIVE_LOCKS_REQUIRED(lock_);
+  void MaybeLogDuDeskReceiveLatency(int64_t now_ms,
+                                    int64_t assembly_ms,
+                                    int64_t jitter_ms,
+                                    int64_t decode_ms);
 
   SequenceChecker construction_thread_;
   Clock* const _clock;
@@ -85,6 +90,12 @@ class VCMDecodedFrameCallback : public DecodedImageCallback {
   VCMTiming* _timing;
   Mutex lock_;
   std::deque<FrameInfo> frame_infos_ RTC_GUARDED_BY(lock_);
+  int64_t dgj_receive_last_log_ms_ RTC_GUARDED_BY(lock_) = 0;
+  std::vector<int64_t> dgj_assembly_samples_ms_ RTC_GUARDED_BY(lock_);
+  std::vector<int64_t> dgj_jitter_samples_ms_ RTC_GUARDED_BY(lock_);
+  std::vector<int64_t> dgj_decode_samples_ms_ RTC_GUARDED_BY(lock_);
+  std::vector<int64_t> dgj_receive_to_decode_samples_ms_
+      RTC_GUARDED_BY(lock_);
   int64_t ntp_offset_;
 };
 

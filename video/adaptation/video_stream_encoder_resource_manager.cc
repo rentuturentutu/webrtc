@@ -677,12 +677,26 @@ CpuOveruseOptions VideoStreamEncoderResourceManager::GetCpuOveruseOptions()
   // This is already ensured by the only caller of this method:
   // StartResourceAdaptation().
   RTC_DCHECK(encoder_settings_.has_value());
+  const VideoEncoder::EncoderInfo& encoder_info =
+      encoder_settings_->encoder_info();
   CpuOveruseOptions options;
   // Hardware accelerated encoders are assumed to be pipelined; give them
   // additional overuse time.
-  if (encoder_settings_->encoder_info().is_hardware_accelerated) {
+  if (encoder_info.is_hardware_accelerated) {
     options.low_encode_usage_threshold_percent = 150;
     options.high_encode_usage_threshold_percent = 200;
+  }
+  // The DuDesk encoder deliberately keeps up to three hardware frames in
+  // flight and returns encoded output asynchronously. WebRTC measures callback
+  // wall time as encode CPU time, so the normal 200% hardware threshold treats
+  // pipeline depth as CPU saturation. Reducing the requested frame rate then
+  // lengthens that wall time and creates a 60 -> 40 -> 26 -> 17 -> 12 fps
+  // feedback loop. The encoder already bounds work with a latest-wins mailbox
+  // and finite hardware buffers, so retain only an emergency 10-frame guard.
+  if (encoder_info.implementation_name == "dgj_hwcodec:auto") {
+    options.low_encode_usage_threshold_percent = 800;
+    options.high_encode_usage_threshold_percent = 1000;
+    RTC_LOG(LS_INFO) << "DUDESK_ASYNC_ENCODER_OVERUSE_GUARD low=800 high=1000";
   }
   if (experiment_cpu_load_estimator_) {
     options.filter_time_ms = 5 * rtc::kNumMillisecsPerSec;
