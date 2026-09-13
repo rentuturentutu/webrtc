@@ -78,6 +78,15 @@ void AlphaMul(uint32_t* data, int width, int height) {
   for (uint32_t* data_end = data + width * height; data != data_end; ++data) {
     RGBQUAD* from = reinterpret_cast<RGBQUAD*>(data);
     RGBQUAD* to = reinterpret_cast<RGBQUAD*>(data);
+    // Transparent cursor pixels must not carry RGB data. Keeping black (or
+    // any other) RGB under A=0 can become a black rectangle when the cursor
+    // is uploaded as a premultiplied-alpha texture by the controller.
+    if (from->rgbReserved == 0) {
+      to->rgbBlue = 0;
+      to->rgbGreen = 0;
+      to->rgbRed = 0;
+      continue;
+    }
     to->rgbBlue =
         (static_cast<uint16_t>(from->rgbBlue) * from->rgbReserved) / 0xff;
     to->rgbGreen =
@@ -226,6 +235,20 @@ MouseCursor* CreateMouseCursorFromHCursor(HDC dc, HCURSOR cursor) {
   // Pre-multiply the resulting pixels since MouseCursor uses premultiplied
   // images.
   AlphaMul(reinterpret_cast<uint32_t*>(image->data()), width, height);
+
+  int transparent_pixels = 0;
+  int opaque_pixels = 0;
+  const auto* pixels = reinterpret_cast<const RGBQUAD*>(image->data());
+  for (int i = 0; i < width * height; ++i) {
+    if (pixels[i].rgbReserved == 0) {
+      ++transparent_pixels;
+    } else {
+      ++opaque_pixels;
+    }
+  }
+  RTC_LOG(LS_INFO) << "DUDESK_CURSOR_WIN shape " << width << "x" << height
+                   << " alpha0=" << transparent_pixels
+                   << " alphaNonZero=" << opaque_pixels;
 
   return new MouseCursor(image.release(), DesktopVector(hotspot_x, hotspot_y));
 }

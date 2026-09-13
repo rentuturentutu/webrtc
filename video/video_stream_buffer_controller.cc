@@ -116,6 +116,10 @@ VideoStreamBufferController::VideoStreamBufferController(
           absl::bind_front(&VideoStreamBufferController::OnTimeout, this)),
       zero_playout_delay_max_decode_queue_size_(
           "max_decode_queue_size",
+          // Keep the upstream default for every stream. Desktop low-latency
+          // callers opt into a one-frame queue explicitly through the
+          // WebRTC-ZeroPlayoutDelay trial; the force-low-latency timing trial
+          // alone must not change camera or ordinary video buffering.
           kZeroPlayoutDelayDefaultMaxDecodeQueueSize) {
   RTC_DCHECK(stats_proxy_);
   RTC_DCHECK(receiver_);
