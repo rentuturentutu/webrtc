@@ -458,6 +458,9 @@ class VideoStreamEncoder : public VideoStreamEncoderInterface,
   QpParser qp_parser_;
   const bool qp_parsing_allowed_;
 
+  // DuDesk zero-hertz quality convergence thresholds (H.264/H.265).
+  const DuDeskZeroHertzConfig dudesk_zero_hertz_config_;
+
   // Enables encoder switching on initialization failures.
   bool switch_encoder_on_init_failures_;
 

@@ -26,6 +26,31 @@
 
 namespace webrtc {
 
+// DuDesk low-latency variant of the zero-hertz screenshare cadence, enabled by
+// the field trial
+//   DuDesk-ZeroHertz/Enabled,first_repeat_ms:80,short_repeat_ms:33,
+//                    idle_repeat_ms:500,max_short_repeats:15,
+//                    converged_qp:22,converged_bytes:1500/
+//
+// Stock zero-hertz delays every fresh frame by one max_fps period and only
+// learns "quality converged" from VP8. The DuDesk variant forwards fresh frames
+// immediately, repeats the last frame only after a real source gap, treats an
+// H.264 QP <= converged_qp or any encoded frame <= converged_bytes (a skipped,
+// fully refined picture) as converged, and caps the short-repeat phase so an
+// encoder that never converges still drops to the idle rate.
+struct DuDeskZeroHertzConfig {
+  bool enabled = false;
+  TimeDelta first_repeat = TimeDelta::Millis(80);
+  TimeDelta short_repeat = TimeDelta::Millis(33);
+  TimeDelta idle_repeat = TimeDelta::Millis(500);
+  int max_short_repeats = 15;
+  int converged_qp = 22;
+  int converged_bytes = 1500;
+};
+
+DuDeskZeroHertzConfig ParseDuDeskZeroHertzConfig(
+    const FieldTrialsView& field_trials);
+
 // A sink adapter implementing mutations to the received frame cadence.
 // With the exception of the constructor and the methods overridden in
 // VideoSinkInterface, the rest of the interface to this class (including dtor)

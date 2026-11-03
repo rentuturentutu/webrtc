@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -42,7 +43,79 @@
 #include "system_wrappers/include/metrics.h"
 #include "system_wrappers/include/ntp_time.h"
 
+// Lets the host verify at runtime that the loaded libwebrtc.dll carries the
+// DuDesk zero-hertz cadence before it stops producing its own heartbeat frames.
+// The string is also searched for directly in the binary as a fallback.
+#if defined(_WIN32)
+extern "C" __declspec(dllexport) const char* DuDeskZeroHertzBuildMarker() {
+  return "DUDESK_ZERO_HERTZ_V1";
+}
+#else
+extern "C" __attribute__((visibility("default"), used)) const char*
+DuDeskZeroHertzBuildMarker() {
+  return "DUDESK_ZERO_HERTZ_V1";
+}
+#endif
+
 namespace webrtc {
+
+namespace {
+
+// Parses "key:<digits>" from a comma separated trial group. Only whole keys
+// match (start of string or right after a comma). Values are clamped.
+int ParseDuDeskInt(const std::string& config,
+                   const char* key,
+                   int default_value,
+                   int min_value,
+                   int max_value) {
+  const std::string needle = std::string(key) + ":";
+  size_t pos = 0;
+  while ((pos = config.find(needle, pos)) != std::string::npos) {
+    if (pos == 0 || config[pos - 1] == ',') {
+      const size_t begin = pos + needle.size();
+      size_t end = begin;
+      while (end < config.size() && end - begin < 7 && config[end] >= '0' &&
+             config[end] <= '9') {
+        ++end;
+      }
+      if (end == begin) {
+        return default_value;
+      }
+      int value = 0;
+      for (size_t i = begin; i < end; ++i) {
+        value = value * 10 + (config[i] - '0');
+      }
+      return std::min(std::max(value, min_value), max_value);
+    }
+    pos += needle.size();
+  }
+  return default_value;
+}
+
+}  // namespace
+
+DuDeskZeroHertzConfig ParseDuDeskZeroHertzConfig(
+    const FieldTrialsView& field_trials) {
+  DuDeskZeroHertzConfig config;
+  const std::string value = field_trials.Lookup("DuDesk-ZeroHertz");
+  config.enabled = value.rfind("Enabled", 0) == 0;
+  if (!config.enabled) {
+    return config;
+  }
+  config.first_repeat = TimeDelta::Millis(
+      ParseDuDeskInt(value, "first_repeat_ms", 80, 16, 1000));
+  config.short_repeat = TimeDelta::Millis(
+      ParseDuDeskInt(value, "short_repeat_ms", 33, 8, 500));
+  config.idle_repeat = TimeDelta::Millis(
+      ParseDuDeskInt(value, "idle_repeat_ms", 500, 100, 2000));
+  config.max_short_repeats =
+      ParseDuDeskInt(value, "max_short_repeats", 15, 0, 300);
+  config.converged_qp = ParseDuDeskInt(value, "converged_qp", 22, 0, 51);
+  config.converged_bytes =
+      ParseDuDeskInt(value, "converged_bytes", 1500, 0, 1000000);
+  return config;
+}
+
 namespace {
 
 // Abstracts concrete modes of the cadence adapter.
@@ -108,7 +181,8 @@ class ZeroHertzAdapterMode : public AdapterMode {
                        FrameCadenceAdapterInterface::Callback* callback,
                        double max_fps,
                        std::atomic<int>& frames_scheduled_for_processing,
-                       bool zero_hertz_queue_overload);
+                       bool zero_hertz_queue_overload,
+                       const DuDeskZeroHertzConfig& dudesk_config);
   ~ZeroHertzAdapterMode() { refresh_frame_requester_.Stop(); }
 
   // Reconfigures according to parameters.
@@ -188,8 +262,21 @@ class ZeroHertzAdapterMode : public AdapterMode {
   // If true is passed in `idle_repeat`, the repeat is going to be
   // kZeroHertzIdleRepeatRatePeriod. Otherwise it'll be the maximum value of
   // `frame_delay` or `restricted_frame_delay_` if it has been set.
-  void ScheduleRepeat(int frame_id, bool idle_repeat)
+  // `after_fresh_frame` marks the first repeat after a new frame; the DuDesk
+  // variant waits `first_repeat` for it so continuous motion never interleaves
+  // repeats with fresh frames.
+  void ScheduleRepeat(int frame_id,
+                      bool idle_repeat,
+                      bool after_fresh_frame = false)
       RTC_RUN_ON(sequence_checker_);
+  // DuDesk variant: the next repeat goes idle once quality converged or the
+  // short-repeat budget is spent.
+  bool DuDeskNextRepeatIsIdle() RTC_RUN_ON(sequence_checker_);
+  // DuDesk variant: VideoStreamEncoder drops a frame whose capture time (ms)
+  // is not strictly newer than the previous one. A fresh frame captured just
+  // before a repeat was sent would otherwise be dropped as kBadTimestamp.
+  void DuDeskEnsureMonotonic(VideoFrame& frame) RTC_RUN_ON(sequence_checker_);
+  void DuDeskMaybeLogStats() RTC_RUN_ON(sequence_checker_);
   // Repeats a frame in the absence of incoming frames. Slows down when quality
   // convergence is attained, and stops the cadence terminally when new frames
   // have arrived.
@@ -229,6 +316,8 @@ class ZeroHertzAdapterMode : public AdapterMode {
   // Can be used as kill-switch for the queue overload mechanism.
   const bool zero_hertz_queue_overload_enabled_;
 
+  const DuDeskZeroHertzConfig dudesk_config_;
+
   // How much the incoming frame sequence is delayed by.
   const TimeDelta frame_delay_ = TimeDelta::Seconds(1) / max_fps_;
 
@@ -255,6 +344,22 @@ class ZeroHertzAdapterMode : public AdapterMode {
   // Set in OnSendFrame to reflect how many future frames will be forwarded with
   // the `queue_overload` flag set to true.
   int queue_overload_count_ RTC_GUARDED_BY(sequence_checker_) = 0;
+
+  // DuDesk variant state.
+  int dudesk_short_repeats_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  bool dudesk_idle_episode_ RTC_GUARDED_BY(sequence_checker_) = false;
+  int64_t dudesk_last_timestamp_us_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_last_ntp_ms_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  // Counters since the previous stats line.
+  int64_t dudesk_fresh_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_short_sent_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_idle_sent_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_idle_converged_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_idle_capped_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_ts_bumped_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_key_requests_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  int64_t dudesk_first_skipped_ RTC_GUARDED_BY(sequence_checker_) = 0;
+  absl::optional<Timestamp> dudesk_last_log_ RTC_GUARDED_BY(sequence_checker_);
 
   ScopedTaskSafety safety_;
 };
@@ -390,6 +495,9 @@ class FrameCadenceAdapterImpl : public FrameCadenceAdapterInterface {
   // Kill-switch for the queue overload mechanism in zero-hertz mode.
   const bool frame_cadence_adapter_zero_hertz_queue_overload_enabled_;
 
+  // DuDesk low-latency zero-hertz variant; disabled unless its trial is set.
+  const DuDeskZeroHertzConfig dudesk_zero_hertz_config_;
+
   // Field trial for using timestamp from video frames, rather than clock when
   // calculating input frame rate.
   const bool use_video_frame_timestamp_;
@@ -445,13 +553,15 @@ ZeroHertzAdapterMode::ZeroHertzAdapterMode(
     FrameCadenceAdapterInterface::Callback* callback,
     double max_fps,
     std::atomic<int>& frames_scheduled_for_processing,
-    bool zero_hertz_queue_overload_enabled)
+    bool zero_hertz_queue_overload_enabled,
+    const DuDeskZeroHertzConfig& dudesk_config)
     : queue_(queue),
       clock_(clock),
       callback_(callback),
       max_fps_(max_fps),
       frames_scheduled_for_processing_(frames_scheduled_for_processing),
-      zero_hertz_queue_overload_enabled_(zero_hertz_queue_overload_enabled) {
+      zero_hertz_queue_overload_enabled_(zero_hertz_queue_overload_enabled),
+      dudesk_config_(dudesk_config) {
   sequence_checker_.Detach();
   MaybeStartRefreshFrameRequester();
 }
@@ -507,6 +617,25 @@ void ZeroHertzAdapterMode::OnFrame(Timestamp post_time,
 
   // Assume all enabled layers are unconverged after frame entry.
   ResetQualityConvergenceInfo();
+
+  if (dudesk_config_.enabled) {
+    // Forward immediately: remote control cannot afford the stock one-period
+    // cadence delay. Any stored repeat source is replaced by this frame.
+    queued_frames_.clear();
+    queued_frames_.push_back(frame);
+    DuDeskEnsureMonotonic(queued_frames_.front());
+    current_frame_id_++;
+    scheduled_repeat_ = absl::nullopt;
+    dudesk_short_repeats_ = 0;
+    dudesk_idle_episode_ = false;
+    ++dudesk_fresh_;
+    ScheduleRepeat(current_frame_id_, /*idle_repeat=*/false,
+                   /*after_fresh_frame=*/true);
+    VideoFrame send_frame = queued_frames_.front();
+    SendFrameNow(post_time, send_frame);
+    DuDeskMaybeLogStats();
+    return;
+  }
 
   // Remove stored repeating frame if needed.
   if (scheduled_repeat_.has_value()) {
@@ -570,6 +699,11 @@ void ZeroHertzAdapterMode::ProcessKeyFrameRequest() {
   // don't get idle repeats shortly after, because key frames need a lot of
   // refinement frames.
   ResetQualityConvergenceInfo();
+  if (dudesk_config_.enabled) {
+    dudesk_short_repeats_ = 0;
+    dudesk_idle_episode_ = false;
+    ++dudesk_key_requests_;
+  }
 
   // If we're not repeating, or we're repeating with short duration, we will
   // very soon send out a frame and don't need a refresh frame.
@@ -646,7 +780,9 @@ void ZeroHertzAdapterMode::ProcessOnDelayedCadence(Timestamp post_time) {
   SendFrameNow(post_time, front_frame);
 }
 
-void ZeroHertzAdapterMode::ScheduleRepeat(int frame_id, bool idle_repeat) {
+void ZeroHertzAdapterMode::ScheduleRepeat(int frame_id,
+                                          bool idle_repeat,
+                                          bool after_fresh_frame) {
   RTC_DCHECK_RUN_ON(&sequence_checker_);
   Timestamp now = clock_->CurrentTime();
   if (!scheduled_repeat_.has_value()) {
@@ -656,7 +792,9 @@ void ZeroHertzAdapterMode::ScheduleRepeat(int frame_id, bool idle_repeat) {
   scheduled_repeat_->scheduled = now;
   scheduled_repeat_->idle = idle_repeat;
 
-  TimeDelta repeat_delay = RepeatDuration(idle_repeat);
+  TimeDelta repeat_delay = dudesk_config_.enabled && after_fresh_frame
+                               ? dudesk_config_.first_repeat
+                               : RepeatDuration(idle_repeat);
   queue_->PostDelayedHighPrecisionTask(
       SafeTask(safety_.flag(),
                [this, frame_id] {
@@ -698,9 +836,109 @@ void ZeroHertzAdapterMode::ProcessRepeatedFrameOnDelayedCadence(int frame_id) {
                           total_delay.ms());
   }
 
+  if (dudesk_config_.enabled) {
+    // The first repeat after a fresh frame exists to refine that frame. If its
+    // own encode already reached the convergence target (a small UI change
+    // usually does), the repeat would be a pure skip frame: go straight to the
+    // idle cadence instead. Convergence is reset on every fresh frame and key
+    // frame request, so an unencoded or not-yet-encoded frame still repeats.
+    if (!scheduled_repeat_->idle && dudesk_short_repeats_ == 0 &&
+        HasQualityConverged()) {
+      ++dudesk_first_skipped_;
+      if (!dudesk_idle_episode_) {
+        dudesk_idle_episode_ = true;
+        ++dudesk_idle_converged_;
+      }
+      ScheduleRepeat(frame_id, /*idle_repeat=*/true);
+      DuDeskMaybeLogStats();
+      return;
+    }
+    if (scheduled_repeat_->idle) {
+      ++dudesk_idle_sent_;
+    } else {
+      ++dudesk_short_sent_;
+      ++dudesk_short_repeats_;
+    }
+    DuDeskEnsureMonotonic(frame);
+    ScheduleRepeat(frame_id, DuDeskNextRepeatIsIdle());
+    VideoFrame send_frame = frame;
+    SendFrameNow(absl::nullopt, send_frame);
+    DuDeskMaybeLogStats();
+    return;
+  }
+
   // Schedule another repeat before sending the frame off which could take time.
   ScheduleRepeat(frame_id, HasQualityConverged());
   SendFrameNow(absl::nullopt, frame);
+}
+
+bool ZeroHertzAdapterMode::DuDeskNextRepeatIsIdle() {
+  RTC_DCHECK_RUN_ON(&sequence_checker_);
+  const bool converged = HasQualityConverged();
+  const bool capped = dudesk_short_repeats_ >= dudesk_config_.max_short_repeats;
+  const bool idle = converged || capped;
+  if (idle && !dudesk_idle_episode_) {
+    dudesk_idle_episode_ = true;
+    if (converged) {
+      ++dudesk_idle_converged_;
+    } else {
+      ++dudesk_idle_capped_;
+    }
+  }
+  return idle;
+}
+
+void ZeroHertzAdapterMode::DuDeskEnsureMonotonic(VideoFrame& frame) {
+  RTC_DCHECK_RUN_ON(&sequence_checker_);
+  bool bumped = false;
+  if (frame.timestamp_us() > 0 && dudesk_last_timestamp_us_ > 0) {
+    // render_time_ms() feeds the encoder's NTP capture time, so compare on
+    // whole milliseconds.
+    const int64_t min_us = (dudesk_last_timestamp_us_ / 1000 + 1) * 1000;
+    if (frame.timestamp_us() < min_us) {
+      frame.set_timestamp_us(min_us);
+      bumped = true;
+    }
+  }
+  if (frame.ntp_time_ms() > 0 && dudesk_last_ntp_ms_ > 0 &&
+      frame.ntp_time_ms() <= dudesk_last_ntp_ms_) {
+    frame.set_ntp_time_ms(dudesk_last_ntp_ms_ + 1);
+    bumped = true;
+  }
+  if (bumped) {
+    ++dudesk_ts_bumped_;
+  }
+  if (frame.timestamp_us() > 0) {
+    dudesk_last_timestamp_us_ = frame.timestamp_us();
+  }
+  if (frame.ntp_time_ms() > 0) {
+    dudesk_last_ntp_ms_ = frame.ntp_time_ms();
+  }
+}
+
+void ZeroHertzAdapterMode::DuDeskMaybeLogStats() {
+  RTC_DCHECK_RUN_ON(&sequence_checker_);
+  const Timestamp now = clock_->CurrentTime();
+  if (!dudesk_last_log_.has_value()) {
+    dudesk_last_log_ = now;
+    return;
+  }
+  if (now - *dudesk_last_log_ < TimeDelta::Seconds(5)) {
+    return;
+  }
+  RTC_LOG(LS_INFO) << "DUDESK_ZERO_HERTZ fresh=" << dudesk_fresh_
+                   << " short_repeats=" << dudesk_short_sent_
+                   << " idle_repeats=" << dudesk_idle_sent_
+                   << " idle_converged=" << dudesk_idle_converged_
+                   << " idle_capped=" << dudesk_idle_capped_
+                   << " first_repeat_skipped=" << dudesk_first_skipped_
+                   << " key_requests=" << dudesk_key_requests_
+                   << " ts_bumped=" << dudesk_ts_bumped_
+                   << " window_ms=" << (now - *dudesk_last_log_).ms();
+  dudesk_last_log_ = now;
+  dudesk_fresh_ = dudesk_short_sent_ = dudesk_idle_sent_ = 0;
+  dudesk_idle_converged_ = dudesk_idle_capped_ = 0;
+  dudesk_ts_bumped_ = dudesk_key_requests_ = dudesk_first_skipped_ = 0;
 }
 
 void ZeroHertzAdapterMode::SendFrameNow(absl::optional<Timestamp> post_time,
@@ -761,6 +999,12 @@ TimeDelta ZeroHertzAdapterMode::FrameDuration() const {
 
 TimeDelta ZeroHertzAdapterMode::RepeatDuration(bool idle_repeat) const {
   RTC_DCHECK_RUN_ON(&sequence_checker_);
+  if (dudesk_config_.enabled) {
+    return idle_repeat ? dudesk_config_.idle_repeat
+                       : std::max(dudesk_config_.short_repeat,
+                                  restricted_frame_delay_.value_or(
+                                      dudesk_config_.short_repeat));
+  }
   return idle_repeat
              ? FrameCadenceAdapterInterface::kZeroHertzIdleRepeatRatePeriod
              : FrameDuration();
@@ -851,6 +1095,7 @@ FrameCadenceAdapterImpl::FrameCadenceAdapterImpl(
           !field_trials.IsDisabled("WebRTC-ZeroHertzScreenshare")),
       frame_cadence_adapter_zero_hertz_queue_overload_enabled_(
           !field_trials.IsDisabled("WebRTC-ZeroHertzQueueOverload")),
+      dudesk_zero_hertz_config_(ParseDuDeskZeroHertzConfig(field_trials)),
       use_video_frame_timestamp_(field_trials.IsEnabled(
           "WebRTC-FrameCadenceAdapter-UseVideoFrameTimestamp")),
       metronome_(metronome),
@@ -1042,11 +1287,21 @@ void FrameCadenceAdapterImpl::MaybeReconfigureAdapters(
                                source_constraints_->max_fps.value_or(-1);
     if (!was_zero_hertz_enabled || max_fps_has_changed) {
       RTC_LOG(LS_INFO) << "Zero hertz mode enabled (max_fps="
-                       << source_constraints_->max_fps.value() << ")";
+                       << source_constraints_->max_fps.value() << ")"
+                       << " dudesk=" << dudesk_zero_hertz_config_.enabled
+                       << " first_repeat_ms="
+                       << dudesk_zero_hertz_config_.first_repeat.ms()
+                       << " short_repeat_ms="
+                       << dudesk_zero_hertz_config_.short_repeat.ms()
+                       << " idle_repeat_ms="
+                       << dudesk_zero_hertz_config_.idle_repeat.ms()
+                       << " max_short_repeats="
+                       << dudesk_zero_hertz_config_.max_short_repeats;
       zero_hertz_adapter_.emplace(
           queue_, clock_, callback_, source_constraints_->max_fps.value(),
           frames_scheduled_for_processing_,
-          frame_cadence_adapter_zero_hertz_queue_overload_enabled_);
+          frame_cadence_adapter_zero_hertz_queue_overload_enabled_,
+          dudesk_zero_hertz_config_);
       zero_hertz_adapter_->UpdateVideoSourceRestrictions(
           restricted_max_frame_rate_);
       zero_hertz_adapter_created_timestamp_ = clock_->CurrentTime();

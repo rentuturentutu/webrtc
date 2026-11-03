@@ -93,10 +93,13 @@ PacingController::ParseRealtimeVideoPacerConfig(
   FieldTrialConstrained<int> max_cross_frame_debt_ms(
       "max_cross_frame_debt_ms",
       static_cast<int>(config.max_cross_frame_debt.ms()), 0, 20);
+  FieldTrialConstrained<int> backlog_ms(
+      "backlog_ms", static_cast<int>(config.backlog_threshold.ms()), 0, 500);
   const size_t parameter_start = trial.find(',');
   if (parameter_start != std::string::npos) {
     ParseFieldTrial({&max_frame_burst_bytes, &max_packet_group_bytes,
-                     &packet_group_interval_ms, &max_cross_frame_debt_ms},
+                     &packet_group_interval_ms, &max_cross_frame_debt_ms,
+                     &backlog_ms},
                     trial.substr(parameter_start + 1));
   }
   config.max_frame_burst_size = DataSize::Bytes(max_frame_burst_bytes.Get());
@@ -105,6 +108,7 @@ PacingController::ParseRealtimeVideoPacerConfig(
       TimeDelta::Millis(packet_group_interval_ms.Get());
   config.max_cross_frame_debt =
       TimeDelta::Millis(max_cross_frame_debt_ms.Get());
+  config.backlog_threshold = TimeDelta::Millis(backlog_ms.Get());
   return config;
 }
 
@@ -194,7 +198,8 @@ PacingController::PacingController(Clock* clock,
         << " packet_group_interval_ms="
         << realtime_video_pacer_.packet_group_interval.ms()
         << " max_cross_frame_debt_ms="
-        << realtime_video_pacer_.max_cross_frame_debt.ms();
+        << realtime_video_pacer_.max_cross_frame_debt.ms()
+        << " backlog_ms=" << realtime_video_pacer_.backlog_threshold.ms();
   }
 }
 
@@ -444,7 +449,11 @@ Timestamp PacingController::NextSendTime() const {
     return last_send_time_ + kCongestedPacketInterval;
   }
 
-  if (IsRealtimeVideoFrameContinuationPending()) {
+  // A backlogged queue skips the group and cross-frame slots and falls through
+  // to the media budget below, i.e. it is paced like the stock pacer.
+  const bool realtime_video_backlogged = RealtimeVideoBacklogged(now);
+  if (IsRealtimeVideoFrameContinuationPending() &&
+      !realtime_video_backlogged) {
     return realtime_video_continuation_send_time_;
   }
 
@@ -452,7 +461,8 @@ Timestamp PacingController::NextSendTime() const {
   if (realtime_video_pacer_.enabled && next_packet != nullptr &&
       next_packet->packet_type() == RtpPacketMediaType::kVideo &&
       realtime_video_cross_frame_send_time_.IsFinite() &&
-      now < realtime_video_cross_frame_send_time_) {
+      now < realtime_video_cross_frame_send_time_ &&
+      !realtime_video_backlogged) {
     return realtime_video_cross_frame_send_time_;
   }
 
@@ -586,6 +596,10 @@ void PacingController::ProcessPackets() {
   if (IsRealtimeVideoFrameContinuationPending()) {
     realtime_video_continuation_pending_ = false;
     ++realtime_video_continuation_wakeups_;
+  }
+  const bool realtime_video_backlog_drain = RealtimeVideoBacklogged(now);
+  if (realtime_video_backlog_drain) {
+    ++realtime_video_backlog_wakeups_;
   }
   for (; iteration < circuit_breaker_threshold_; ++iteration) {
     // Fetch packet, so long as queue is not empty or budget is not
@@ -724,6 +738,11 @@ void PacingController::ProcessPackets() {
           break;
         }
         if (target_send_time > now) {
+          // Draining a backlog: the media budget, not the frame, decides when
+          // to stop, so the drain never exceeds the pacing rate.
+          if (realtime_video_backlog_drain) {
+            break;
+          }
           target_send_time = now;
         }
       } else if (target_send_time > now) {
@@ -1001,8 +1020,24 @@ absl::optional<DataSize> PacingController::NextRealtimeVideoPacketSize(
   return next_packet_size;
 }
 
+bool PacingController::RealtimeVideoBacklogged(Timestamp now) const {
+  if (!realtime_video_pacer_.enabled || congested_ || paused_ ||
+      realtime_video_pacer_.backlog_threshold <= TimeDelta::Zero()) {
+    return false;
+  }
+  const Timestamp oldest_video =
+      packet_queue_.LeadingPacketEnqueueTime(RtpPacketMediaType::kVideo);
+  return oldest_video.IsFinite() &&
+         now - oldest_video >= realtime_video_pacer_.backlog_threshold;
+}
+
 void PacingController::ClampRealtimeVideoMediaDebtAfterFrameBurst() {
   if (adjusted_media_rate_ <= DataRate::Zero()) {
+    return;
+  }
+  // While backlogged the budget is what paces the drain; forgetting debt here
+  // would let the whole queue leave in one burst.
+  if (RealtimeVideoBacklogged(CurrentTime())) {
     return;
   }
 
@@ -1093,6 +1128,7 @@ void PacingController::MaybeLogRealtimeVideoFrameBurst(
       << " packet_groups=" << realtime_video_packet_groups_
       << " continuation_wakeups=" << realtime_video_continuation_wakeups_
       << " frame_cap_hits=" << realtime_video_frame_cap_hits_
+      << " backlog_wakeups=" << realtime_video_backlog_wakeups_
       << " max_group_bytes=" << realtime_video_max_packet_group_bytes_.bytes()
       << " max_frame_send_span_ms=" << realtime_video_max_frame_send_span_.ms()
       << " max_capture_to_first_send_ms="
@@ -1124,6 +1160,7 @@ void PacingController::MaybeLogRealtimeVideoFrameBurst(
   realtime_video_packet_groups_ = 0;
   realtime_video_continuation_wakeups_ = 0;
   realtime_video_frame_cap_hits_ = 0;
+  realtime_video_backlog_wakeups_ = 0;
   realtime_video_max_packet_group_bytes_ = DataSize::Zero();
   realtime_video_max_frame_send_span_ = TimeDelta::Zero();
   realtime_video_max_capture_to_first_send_ = TimeDelta::Zero();

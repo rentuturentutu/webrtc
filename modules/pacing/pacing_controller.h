@@ -219,6 +219,13 @@ class PacingController {
     DataSize max_packet_group_size = DataSize::Bytes(48 * 1024);
     TimeDelta packet_group_interval = TimeDelta::Millis(1);
     TimeDelta max_cross_frame_debt = TimeDelta::Millis(6);
+    // Once the oldest queued packet has waited this long, the per-frame and
+    // per-group spacing above is suspended and the queue drains under the
+    // normal media budget. The spacing smooths a single frame; it must not
+    // throttle a queue that already holds several frames (Windows timer
+    // wakeups are coarse, and one frame or group per wakeup then cannot keep
+    // up with 60 fps at high bitrate). Zero disables the bypass.
+    TimeDelta backlog_threshold = TimeDelta::Millis(20);
   };
 
   static RealtimeVideoPacerConfig ParseRealtimeVideoPacerConfig(
@@ -254,6 +261,7 @@ class PacingController {
   absl::optional<DataSize> NextRealtimeVideoPacketSize(
       uint32_t ssrc,
       uint32_t rtp_timestamp) const;
+  bool RealtimeVideoBacklogged(Timestamp now) const;
   void ClampRealtimeVideoMediaDebtAfterFrameBurst();
   void ResetRealtimeVideoFrameState();
   void MaybeLogRealtimeVideoFrameBurst(Timestamp now,
@@ -289,6 +297,7 @@ class PacingController {
   uint64_t realtime_video_packet_groups_;
   uint64_t realtime_video_continuation_wakeups_;
   uint64_t realtime_video_frame_cap_hits_;
+  uint64_t realtime_video_backlog_wakeups_ = 0;
   DataSize realtime_video_max_packet_group_bytes_;
   TimeDelta realtime_video_max_frame_send_span_;
   TimeDelta realtime_video_max_capture_to_first_send_;

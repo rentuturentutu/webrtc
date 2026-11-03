@@ -8,6 +8,21 @@
 
 import("../../webrtc.gni")
 
+# Standalone production-code probe, also usable with rtc_include_tests=false.
+rtc_executable("dudesk_pause_regression_test") {
+  sources = [ "dudesk_pause_regression_test.cc" ]
+  deps = [
+    ":pacing",
+    "../../api:field_trials_view",
+    "../../api/units:data_rate",
+    "../../api/units:data_size",
+    "../../api/units:time_delta",
+    "../../api/units:timestamp",
+    "../../system_wrappers",
+    "../rtp_rtcp:rtp_rtcp_format",
+  ]
+}
+
 rtc_library("pacing") {
   # Client code SHOULD NOT USE THIS TARGET, but for now it needs to be public
   # because there exists client code that uses it.

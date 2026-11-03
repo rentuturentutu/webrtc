@@ -699,6 +699,8 @@ VideoStreamEncoder::VideoStreamEncoder(
           "WebRTC-DefaultBitrateLimitsKillSwitch")),
       qp_parsing_allowed_(
           !env_.field_trials().IsEnabled("WebRTC-QpParsingKillSwitch")),
+      dudesk_zero_hertz_config_(
+          ParseDuDeskZeroHertzConfig(env_.field_trials())),
       switch_encoder_on_init_failures_(!env_.field_trials().IsDisabled(
           kSwitchEncoderOnInitializationFailuresFieldTrial)),
       vp9_low_tier_core_threshold_(
@@ -2125,8 +2127,20 @@ EncodedImage VideoStreamEncoder::AugmentEncodedImage(
   RTC_LOG(LS_VERBOSE) << __func__ << " ntp time " << encoded_image.NtpTimeMs()
                       << " stream_idx " << stream_idx << " qp "
                       << image_copy.qp_;
-  image_copy.SetAtTargetQuality(codec_type == kVideoCodecVP8 &&
-                                image_copy.qp_ <= kVp8SteadyStateQpThreshold);
+  bool at_target_quality = codec_type == kVideoCodecVP8 &&
+                           image_copy.qp_ <= kVp8SteadyStateQpThreshold;
+  if (!at_target_quality && dudesk_zero_hertz_config_.enabled &&
+      (codec_type == kVideoCodecH264 || codec_type == kVideoCodecH265)) {
+    // A picture is refined once its QP is low enough, or once the encoder has
+    // nothing left to send for it (a repeat coded almost entirely as skip).
+    // H.265 has no slice-QP parser in this branch, so it relies on size.
+    at_target_quality =
+        (image_copy.qp_ >= 0 &&
+         image_copy.qp_ <= dudesk_zero_hertz_config_.converged_qp) ||
+        image_copy.size() <=
+            static_cast<size_t>(dudesk_zero_hertz_config_.converged_bytes);
+  }
+  image_copy.SetAtTargetQuality(at_target_quality);
 
   return image_copy;
 }

@@ -17,6 +17,7 @@
 
 #include "rtc_base/logging.h"
 #include "rtc_base/strings/string_builder.h"
+#include "system_wrappers/include/field_trial.h"
 #include "system_wrappers/include/metrics.h"
 #include "video/video_receive_stream2.h"
 
@@ -36,6 +37,42 @@ constexpr int kBlockyQpThresholdVp8 = 70;
 constexpr int kBlockyQpThresholdVp9 = 180;
 constexpr int kMaxNumCachedBlockyFrames = 100;
 // TODO(ilnik): Add H264/HEVC thresholds.
+
+// DuDesk zero-hertz senders stop producing frames on a static screen and only
+// send an idle repeat every idle_repeat_ms (default 500 ms). Gaps up to that
+// interval are the expected cadence, not freezes. Under the same field trial
+// the receiver only counts a gap as a freeze once it exceeds twice the idle
+// repeat interval, i.e. the sender missed at least one guaranteed repeat.
+// Returns 0 (no floor) when the trial is not enabled.
+int64_t DuDeskFreezeFloorMs() {
+  static const int64_t floor_ms = [] {
+    const std::string trial = field_trial::FindFullName("DuDesk-ZeroHertz");
+    if (trial.rfind("Enabled", 0) != 0) {
+      return int64_t{0};
+    }
+    int64_t idle_repeat_ms = 500;
+    const std::string key = "idle_repeat_ms:";
+    const size_t pos = trial.find(key);
+    if (pos != std::string::npos) {
+      int64_t value = 0;
+      size_t i = pos + key.size();
+      bool any = false;
+      while (i < trial.size() && trial[i] >= '0' && trial[i] <= '9' &&
+             value < 100000) {
+        value = value * 10 + (trial[i] - '0');
+        any = true;
+        ++i;
+      }
+      if (any) {
+        idle_repeat_ms = std::min<int64_t>(std::max<int64_t>(value, 100), 2000);
+      }
+    }
+    RTC_LOG(LS_INFO) << "DUDESK_ZERO_HERTZ receiver freeze_floor_ms="
+                     << 2 * idle_repeat_ms;
+    return 2 * idle_repeat_ms;
+  }();
+  return floor_ms;
+}
 }  // namespace
 
 VideoQualityObserver::VideoQualityObserver()
@@ -170,7 +207,8 @@ void VideoQualityObserver::OnRenderedFrame(
         RTC_DCHECK(avg_interframe_delay);
         was_freeze = interframe_delay_ms >=
                      std::max(3 * *avg_interframe_delay,
-                              *avg_interframe_delay + kMinIncreaseForFreezeMs);
+                              *avg_interframe_delay + kMinIncreaseForFreezeMs) &&
+                     interframe_delay_ms >= DuDeskFreezeFloorMs();
       }
 
       if (was_freeze) {
